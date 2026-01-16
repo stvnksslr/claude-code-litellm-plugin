@@ -123,7 +123,22 @@ function Main {
 
     Write-Host ""
     Write-Info "Installation complete!"
-    Write-Info "Make sure ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN are set."
+
+    # Check if required env vars are set
+    $missingVars = @()
+    if (-not $env:ANTHROPIC_BASE_URL -and -not $env:LITELLM_PROXY_URL) {
+        $missingVars += "ANTHROPIC_BASE_URL or LITELLM_PROXY_URL"
+    }
+    if (-not $env:ANTHROPIC_AUTH_TOKEN -and -not $env:LITELLM_PROXY_API_KEY) {
+        $missingVars += "ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY"
+    }
+
+    if ($missingVars.Count -gt 0) {
+        Write-Warn "Missing environment variables:"
+        foreach ($var in $missingVars) {
+            Write-Warn "  - $var"
+        }
+    }
 }
 
 Main

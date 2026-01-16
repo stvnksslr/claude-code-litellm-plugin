@@ -155,7 +155,22 @@ main() {
 
     echo ""
     info "Installation complete!"
-    info "Make sure ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN are set."
+
+    # Check if required env vars are set
+    local missing_vars=()
+    if [ -z "${ANTHROPIC_BASE_URL:-}" ] && [ -z "${LITELLM_PROXY_URL:-}" ]; then
+        missing_vars+=("ANTHROPIC_BASE_URL or LITELLM_PROXY_URL")
+    fi
+    if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${LITELLM_PROXY_API_KEY:-}" ]; then
+        missing_vars+=("ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY")
+    fi
+
+    if [ ${#missing_vars[@]} -gt 0 ]; then
+        warn "Missing environment variables:"
+        for var in "${missing_vars[@]}"; do
+            warn "  - $var"
+        done
+    fi
 }
 
 main "$@"
