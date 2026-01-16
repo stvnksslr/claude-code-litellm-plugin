@@ -4,20 +4,47 @@ A statusline plugin for Claude Code that displays LiteLLM budget information inc
 
 ## Installation
 
-1. Build the plugin:
+### Quick Install (Recommended)
+
+**macOS / Linux:**
 
 ```bash
-go build main.go
+curl -fsSL https://raw.githubusercontent.com/stvnksslr/claude-code-litellm-plugin/main/install.sh | bash
 ```
 
-2. Move the binary to a location in your PATH:
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/stvnksslr/claude-code-litellm-plugin/main/install.ps1 | iex
+```
+
+The installer will:
+- Download the latest release for your OS and architecture
+- Install the binary to your PATH
+- Configure Claude Code to use the plugin
+
+### Manual Installation
+
+1. Download the latest release from the [releases page](https://github.com/stvnksslr/claude-code-litellm-plugin/releases)
+
+2. Extract and move the binary to a location in your PATH:
 
 ```bash
-# Example: move to /usr/local/bin
-sudo mv claude-code-litellm-plugin /usr/local/bin/
+# Example: move to ~/.local/bin
+mv claude-code-litellm-plugin ~/.local/bin/
+chmod +x ~/.local/bin/claude-code-litellm-plugin
 ```
 
-Or keep it in the project directory and reference the full path in your configuration.
+3. Add the statusline configuration to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "claude-code-litellm-plugin"
+  }
+}
+```
 
 ## Configuration
 
