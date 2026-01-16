@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go fmt
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Code is not formatted. Run 'go fmt ./...'"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
+            echo "go.mod or go.sum is not tidy. Run 'go mod tidy'"
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: go test
+        run: go test -v ./...
