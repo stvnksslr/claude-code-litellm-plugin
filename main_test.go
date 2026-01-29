@@ -9,34 +9,77 @@ import (
 	"time"
 )
 
+func strPtr(s string) *string {
+	return &s
+}
+
 func TestFormatTimeUntilReset(t *testing.T) {
 	tests := []struct {
-		name     string
-		resetAt  string
-		expected string
+		name           string
+		resetAt        *string
+		budgetDuration *string
+		expectedTime   string
+		expectedLabel  string
 	}{
 		{
-			name:     "empty string",
-			resetAt:  "",
-			expected: "unknown",
+			name:           "nil resetAt and nil duration",
+			resetAt:        nil,
+			budgetDuration: nil,
+			expectedTime:   "",
+			expectedLabel:  "",
 		},
 		{
-			name:     "invalid format",
-			resetAt:  "not-a-date",
-			expected: "unknown",
+			name:           "empty string resetAt",
+			resetAt:        strPtr(""),
+			budgetDuration: nil,
+			expectedTime:   "",
+			expectedLabel:  "",
 		},
 		{
-			name:     "past time",
-			resetAt:  "2020-01-01T00:00:00Z",
-			expected: "resetting",
+			name:           "invalid format",
+			resetAt:        strPtr("not-a-date"),
+			budgetDuration: nil,
+			expectedTime:   "",
+			expectedLabel:  "",
+		},
+		{
+			name:           "past time",
+			resetAt:        strPtr("2020-01-01T00:00:00Z"),
+			budgetDuration: nil,
+			expectedTime:   "resetting",
+			expectedLabel:  "",
+		},
+		{
+			name:           "with monthly duration label",
+			resetAt:        strPtr("2020-01-01T00:00:00Z"),
+			budgetDuration: strPtr("30d"),
+			expectedTime:   "resetting",
+			expectedLabel:  "monthly",
+		},
+		{
+			name:           "with weekly duration label",
+			resetAt:        strPtr("2020-01-01T00:00:00Z"),
+			budgetDuration: strPtr("7d"),
+			expectedTime:   "resetting",
+			expectedLabel:  "weekly",
+		},
+		{
+			name:           "with daily duration label",
+			resetAt:        strPtr("2020-01-01T00:00:00Z"),
+			budgetDuration: strPtr("1d"),
+			expectedTime:   "resetting",
+			expectedLabel:  "daily",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := formatTimeUntilReset(tt.resetAt)
-			if result != tt.expected {
-				t.Errorf("formatTimeUntilReset(%q) = %q, want %q", tt.resetAt, result, tt.expected)
+			resultTime, resultLabel := formatTimeUntilReset(tt.resetAt, tt.budgetDuration)
+			if resultTime != tt.expectedTime {
+				t.Errorf("formatTimeUntilReset time = %q, want %q", resultTime, tt.expectedTime)
+			}
+			if resultLabel != tt.expectedLabel {
+				t.Errorf("formatTimeUntilReset label = %q, want %q", resultLabel, tt.expectedLabel)
 			}
 		})
 	}
@@ -45,7 +88,7 @@ func TestFormatTimeUntilReset(t *testing.T) {
 	t.Run("future time with days", func(t *testing.T) {
 		future := time.Now().UTC().Add(50 * time.Hour)
 		resetAt := future.Format("2006-01-02T15:04:05Z")
-		result := formatTimeUntilReset(resetAt)
+		result, _ := formatTimeUntilReset(&resetAt, nil)
 		if !strings.Contains(result, "d") {
 			t.Errorf("expected result to contain 'd' for days, got %q", result)
 		}
@@ -54,7 +97,7 @@ func TestFormatTimeUntilReset(t *testing.T) {
 	t.Run("future time with hours only", func(t *testing.T) {
 		future := time.Now().UTC().Add(5 * time.Hour)
 		resetAt := future.Format("2006-01-02T15:04:05Z")
-		result := formatTimeUntilReset(resetAt)
+		result, _ := formatTimeUntilReset(&resetAt, nil)
 		if !strings.Contains(result, "h") {
 			t.Errorf("expected result to contain 'h' for hours, got %q", result)
 		}
@@ -63,9 +106,99 @@ func TestFormatTimeUntilReset(t *testing.T) {
 	t.Run("future time with minutes only", func(t *testing.T) {
 		future := time.Now().UTC().Add(30 * time.Minute)
 		resetAt := future.Format("2006-01-02T15:04:05Z")
-		result := formatTimeUntilReset(resetAt)
+		result, _ := formatTimeUntilReset(&resetAt, nil)
 		if !strings.Contains(result, "m") {
 			t.Errorf("expected result to contain 'm' for minutes, got %q", result)
+		}
+	})
+
+	// Test budget_duration fallback
+	t.Run("daily duration fallback", func(t *testing.T) {
+		result, label := formatTimeUntilReset(nil, strPtr("1d"))
+		if result == "" {
+			t.Error("expected non-empty result for daily duration")
+		}
+		if label != "daily" {
+			t.Errorf("expected label 'daily', got %q", label)
+		}
+	})
+
+	t.Run("weekly duration fallback", func(t *testing.T) {
+		result, label := formatTimeUntilReset(nil, strPtr("7d"))
+		if result == "" {
+			t.Error("expected non-empty result for weekly duration")
+		}
+		if label != "weekly" {
+			t.Errorf("expected label 'weekly', got %q", label)
+		}
+	})
+
+	t.Run("monthly duration fallback", func(t *testing.T) {
+		result, label := formatTimeUntilReset(nil, strPtr("30d"))
+		if result == "" {
+			t.Error("expected non-empty result for monthly duration")
+		}
+		if label != "monthly" {
+			t.Errorf("expected label 'monthly', got %q", label)
+		}
+	})
+}
+
+func TestCalculateNextReset(t *testing.T) {
+	now := time.Now().UTC()
+
+	t.Run("daily reset", func(t *testing.T) {
+		result := calculateNextReset("1d")
+		// Should be tomorrow at midnight
+		expected := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+		if !result.Equal(expected) {
+			t.Errorf("calculateNextReset(1d) = %v, want %v", result, expected)
+		}
+	})
+
+	t.Run("daily reset (24h)", func(t *testing.T) {
+		result := calculateNextReset("24h")
+		expected := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+		if !result.Equal(expected) {
+			t.Errorf("calculateNextReset(24h) = %v, want %v", result, expected)
+		}
+	})
+
+	t.Run("weekly reset", func(t *testing.T) {
+		result := calculateNextReset("7d")
+		// Should be next Monday at midnight
+		if result.Weekday() != time.Monday {
+			t.Errorf("calculateNextReset(7d) weekday = %v, want Monday", result.Weekday())
+		}
+		if result.Before(now) {
+			t.Errorf("calculateNextReset(7d) = %v, should be in the future", result)
+		}
+	})
+
+	t.Run("monthly reset", func(t *testing.T) {
+		result := calculateNextReset("30d")
+		// Should be 1st of next month at midnight
+		if result.Day() != 1 {
+			t.Errorf("calculateNextReset(30d) day = %d, want 1", result.Day())
+		}
+		if result.Before(now) {
+			t.Errorf("calculateNextReset(30d) = %v, should be in the future", result)
+		}
+	})
+
+	t.Run("custom hours duration", func(t *testing.T) {
+		result := calculateNextReset("48h")
+		expected := now.Add(48 * time.Hour)
+		// Allow 1 second tolerance
+		if result.Sub(expected).Abs() > time.Second {
+			t.Errorf("calculateNextReset(48h) = %v, want approximately %v", result, expected)
+		}
+	})
+
+	t.Run("unknown duration returns zero", func(t *testing.T) {
+		result := calculateNextReset("invalid")
+		if !result.IsZero() {
+			t.Errorf("calculateNextReset(invalid) = %v, want zero time", result)
 		}
 	})
 }
@@ -185,10 +318,40 @@ func TestFormatStatusLine(t *testing.T) {
 			info: &KeyInfo{
 				Spend:         &spend25,
 				MaxBudget:     &budget100,
-				BudgetResetAt: "2020-01-01T00:00:00Z", // past time
+				BudgetResetAt: strPtr("2020-01-01T00:00:00Z"), // past time
 			},
 			expectColor:    ColorGreen,
 			expectContains: []string{"LiteLLM:", "reset:", "resetting"},
+		},
+		{
+			name: "with budget duration only (monthly)",
+			info: &KeyInfo{
+				Spend:          &spend25,
+				MaxBudget:      &budget100,
+				BudgetDuration: strPtr("30d"),
+			},
+			expectColor:    ColorGreen,
+			expectContains: []string{"LiteLLM:", "reset:"},
+		},
+		{
+			name: "with budget duration only (daily)",
+			info: &KeyInfo{
+				Spend:          &spend25,
+				MaxBudget:      &budget100,
+				BudgetDuration: strPtr("1d"),
+			},
+			expectColor:    ColorGreen,
+			expectContains: []string{"LiteLLM:", "reset:"},
+		},
+		{
+			name: "with budget duration only (weekly)",
+			info: &KeyInfo{
+				Spend:          &spend25,
+				MaxBudget:      &budget100,
+				BudgetDuration: strPtr("7d"),
+			},
+			expectColor:    ColorGreen,
+			expectContains: []string{"LiteLLM:", "reset:"},
 		},
 	}
 
@@ -279,11 +442,12 @@ func TestGetKeyInfoWithMockServer(t *testing.T) {
 			return
 		}
 
+		resetAt := "2025-01-15T10:00:00Z"
 		response := KeyInfoResponse{
 			Info: KeyInfo{
 				Spend:         &spend,
 				MaxBudget:     &budget,
-				BudgetResetAt: "2025-01-15T10:00:00Z",
+				BudgetResetAt: &resetAt,
 			},
 		}
 

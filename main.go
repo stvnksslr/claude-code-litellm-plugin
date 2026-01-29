@@ -53,9 +53,10 @@ type KeyInfoResponse struct {
 
 // KeyInfo represents the budget information
 type KeyInfo struct {
-	Spend         *float64 `json:"spend"`
-	MaxBudget     *float64 `json:"max_budget"`
-	BudgetResetAt string   `json:"budget_reset_at"`
+	Spend          *float64 `json:"spend"`
+	MaxBudget      *float64 `json:"max_budget"`
+	BudgetResetAt  *string  `json:"budget_reset_at"`
+	BudgetDuration *string  `json:"budget_duration"`
 }
 
 // getEnvWithFallback returns the first non-empty environment variable value
@@ -77,6 +78,12 @@ func getBaseURL() string {
 // getToken returns the API token from environment
 func getToken() string {
 	return getEnvWithFallback("ANTHROPIC_AUTH_TOKEN", "LITELLM_PROXY_API_KEY")
+}
+
+// isDebug returns true if debug mode is enabled via LITELLM_DEBUG environment variable
+func isDebug() bool {
+	val := os.Getenv("LITELLM_DEBUG")
+	return val == "1" || val == "true"
 }
 
 // getKeyInfo fetches budget info from the LiteLLM API with caching and exponential backoff
@@ -130,7 +137,7 @@ func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 	client := &http.Client{Timeout: HTTPTimeout}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("request creation failed: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -138,26 +145,26 @@ func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("connection error: %w [url=%s]", err, url)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("auth error: %d", resp.StatusCode)
+		return nil, fmt.Errorf("auth error: status=%d url=%s body=%s", resp.StatusCode, url, string(body))
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("HTTP error: status=%d url=%s body=%s", resp.StatusCode, url, string(body))
 	}
 
 	var response KeyInfoResponse
 	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("JSON parse error: %w [body=%s]", err, string(body))
 	}
 
 	return &response.Info, nil
@@ -184,20 +191,70 @@ func parseISOTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse time: %s", s)
 }
 
-// formatTimeUntilReset formats the time remaining until budget reset
-func formatTimeUntilReset(resetAt string) string {
-	if resetAt == "" {
-		return "unknown"
-	}
-
-	t, err := parseISOTime(resetAt)
-	if err != nil {
-		return "unknown"
-	}
-
+// calculateNextReset calculates the next reset time based on budget_duration
+// Supports formats like "30d", "7d", "1d", "24h", etc.
+// Returns the next reset time according to LiteLLM's reset rules:
+// - Daily (24h/1d): Reset at midnight every day
+// - Weekly (7d): Reset on Monday at midnight
+// - Monthly (30d): Reset on the 1st of each month at midnight
+func calculateNextReset(duration string) time.Time {
 	now := time.Now().UTC()
-	diff := t.Sub(now)
 
+	// Parse duration string (e.g., "30d", "7d", "1d", "24h")
+	duration = strings.TrimSpace(strings.ToLower(duration))
+
+	switch duration {
+	case "30d", "1mo", "monthly":
+		// Monthly: Reset on 1st of next month at midnight
+		year, month, _ := now.Date()
+		nextMonth := month + 1
+		nextYear := year
+		if nextMonth > 12 {
+			nextMonth = 1
+			nextYear++
+		}
+		return time.Date(nextYear, nextMonth, 1, 0, 0, 0, 0, time.UTC)
+
+	case "7d", "weekly":
+		// Weekly: Reset on next Monday at midnight
+		daysUntilMonday := (8 - int(now.Weekday())) % 7
+		if daysUntilMonday == 0 {
+			daysUntilMonday = 7 // If today is Monday, next reset is next Monday
+		}
+		nextMonday := now.AddDate(0, 0, daysUntilMonday)
+		return time.Date(nextMonday.Year(), nextMonday.Month(), nextMonday.Day(), 0, 0, 0, 0, time.UTC)
+
+	case "1d", "24h", "daily":
+		// Daily: Reset at next midnight
+		tomorrow := now.AddDate(0, 0, 1)
+		return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 0, 0, 0, 0, time.UTC)
+
+	default:
+		// Try to parse as a duration with suffix (e.g., "48h", "2d")
+		if len(duration) > 1 {
+			suffix := duration[len(duration)-1]
+			valueStr := duration[:len(duration)-1]
+			var value int
+			if _, err := fmt.Sscanf(valueStr, "%d", &value); err == nil {
+				switch suffix {
+				case 'd':
+					return now.AddDate(0, 0, value)
+				case 'h':
+					return now.Add(time.Duration(value) * time.Hour)
+				case 'm':
+					return now.Add(time.Duration(value) * time.Minute)
+				case 's':
+					return now.Add(time.Duration(value) * time.Second)
+				}
+			}
+		}
+		// Fallback: return zero time (will show "unknown")
+		return time.Time{}
+	}
+}
+
+// formatDuration formats a time.Duration as a human-readable string
+func formatDuration(diff time.Duration) string {
 	if diff <= 0 {
 		return "resetting"
 	}
@@ -216,6 +273,50 @@ func formatTimeUntilReset(resetAt string) string {
 		return fmt.Sprintf("%dm", minutes)
 	}
 	return "resetting"
+}
+
+// getDurationLabel returns a human-readable label for the budget duration
+func getDurationLabel(duration string) string {
+	duration = strings.TrimSpace(strings.ToLower(duration))
+	switch duration {
+	case "30d", "1mo", "monthly":
+		return "monthly"
+	case "7d", "weekly":
+		return "weekly"
+	case "1d", "24h", "daily":
+		return "daily"
+	default:
+		return ""
+	}
+}
+
+// formatTimeUntilReset formats the time remaining until budget reset
+// Returns (timeString, durationLabel)
+func formatTimeUntilReset(resetAt *string, budgetDuration *string) (string, string) {
+	now := time.Now().UTC()
+	var durationLabel string
+
+	if budgetDuration != nil && *budgetDuration != "" {
+		durationLabel = getDurationLabel(*budgetDuration)
+	}
+
+	// First try to use budget_reset_at if provided
+	if resetAt != nil && *resetAt != "" {
+		t, err := parseISOTime(*resetAt)
+		if err == nil {
+			return formatDuration(t.Sub(now)), durationLabel
+		}
+	}
+
+	// Fall back to calculating from budget_duration
+	if budgetDuration != nil && *budgetDuration != "" {
+		nextReset := calculateNextReset(*budgetDuration)
+		if !nextReset.IsZero() {
+			return formatDuration(nextReset.Sub(now)), durationLabel
+		}
+	}
+
+	return "", ""
 }
 
 // formatStatusLine formats the budget info as a colored status line
@@ -250,9 +351,13 @@ func formatStatusLine(info *KeyInfo) string {
 	}
 
 	resetStr := ""
-	if info.BudgetResetAt != "" {
-		resetTime := formatTimeUntilReset(info.BudgetResetAt)
-		resetStr = fmt.Sprintf(" %s| reset: %s%s", ColorGray, resetTime, ColorReset)
+	resetTime, durationLabel := formatTimeUntilReset(info.BudgetResetAt, info.BudgetDuration)
+	if resetTime != "" {
+		if durationLabel != "" {
+			resetStr = fmt.Sprintf(" %s| %s reset: %s%s", ColorGray, durationLabel, resetTime, ColorReset)
+		} else {
+			resetStr = fmt.Sprintf(" %s| reset: %s%s", ColorGray, resetTime, ColorReset)
+		}
 	}
 
 	return fmt.Sprintf("%sLiteLLM: %s%s%s%s", color, budgetStr, percentStr, ColorReset, resetStr)
@@ -276,14 +381,28 @@ func main() {
 	info, err := getKeyInfo(token)
 	if err != nil {
 		errStr := err.Error()
+		debug := isDebug()
+
 		if strings.Contains(errStr, "cooldown") {
 			fmt.Println(formatError("Cooldown (retrying in 5m)"))
 		} else if strings.Contains(errStr, "auth error") {
-			fmt.Println(formatError("Auth error"))
+			if debug {
+				fmt.Println(formatError("Auth error: " + errStr))
+			} else {
+				fmt.Println(formatError("Auth error"))
+			}
 		} else if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "connection") || strings.Contains(errStr, "dial") {
-			fmt.Println(formatError("Connection error"))
+			if debug {
+				fmt.Println(formatError("Connection error: " + errStr))
+			} else {
+				fmt.Println(formatError("Connection error"))
+			}
 		} else {
-			fmt.Println(formatError("Error"))
+			if debug {
+				fmt.Println(formatError("Error: " + errStr))
+			} else {
+				fmt.Println(formatError("Error"))
+			}
 		}
 		return
 	}
