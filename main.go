@@ -71,13 +71,13 @@ func getEnvWithFallback(keys ...string) string {
 
 // getBaseURL returns the LiteLLM base URL from environment
 func getBaseURL() string {
-	url := getEnvWithFallback("ANTHROPIC_BASE_URL", "LITELLM_PROXY_URL")
+	url := getEnvWithFallback("LITELLM_PROXY_URL", "ANTHROPIC_BASE_URL")
 	return strings.TrimSuffix(url, "/")
 }
 
 // getToken returns the API token from environment
 func getToken() string {
-	return getEnvWithFallback("ANTHROPIC_AUTH_TOKEN", "LITELLM_PROXY_API_KEY")
+	return getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 }
 
 // isDebug returns true if debug mode is enabled via LITELLM_DEBUG environment variable

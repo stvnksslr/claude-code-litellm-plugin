@@ -108,13 +108,13 @@ The plugin checks environment variables in the following order:
 
 **Base URL:**
 
-1. `ANTHROPIC_BASE_URL`
-2. `LITELLM_PROXY_URL`
+1. `LITELLM_PROXY_URL`
+2. `ANTHROPIC_BASE_URL`
 
 **API Key:**
 
-1. `ANTHROPIC_AUTH_TOKEN`
-2. `LITELLM_PROXY_API_KEY`
+1. `LITELLM_PROXY_API_KEY`
+2. `ANTHROPIC_AUTH_TOKEN`
 
 ## Troubleshooting
 
