@@ -35,4 +35,7 @@ read -rp "Proceed? [y/N] " confirm
 
 git tag "$new_tag"
 git push origin "$new_tag"
+
+echo "Creating GitHub release..."
+gh release create "$new_tag" --generate-notes
 echo "Released ${new_tag}"
