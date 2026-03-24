@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +71,13 @@ func TestFormatTimeUntilReset(t *testing.T) {
 			budgetDuration: strPtr("1d"),
 			expectedTime:   "resetting",
 			expectedLabel:  "daily",
+		},
+		{
+			name:           "unknown duration format shows unknown",
+			resetAt:        nil,
+			budgetDuration: strPtr("badformat"),
+			expectedTime:   "unknown",
+			expectedLabel:  "",
 		},
 	}
 
@@ -146,43 +155,67 @@ func TestFormatTimeUntilReset(t *testing.T) {
 
 func TestCalculateNextReset(t *testing.T) {
 	now := time.Now().UTC()
+	tolerance := 2 * time.Second
 
-	t.Run("daily reset", func(t *testing.T) {
+	t.Run("daily reset (1d)", func(t *testing.T) {
 		result := calculateNextReset("1d")
-		// Should be tomorrow at midnight
-		expected := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
-		if !result.Equal(expected) {
-			t.Errorf("calculateNextReset(1d) = %v, want %v", result, expected)
+		expected := now.Add(24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(1d) = %v, want approximately %v", result, expected)
 		}
 	})
 
 	t.Run("daily reset (24h)", func(t *testing.T) {
 		result := calculateNextReset("24h")
-		expected := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
-		if !result.Equal(expected) {
-			t.Errorf("calculateNextReset(24h) = %v, want %v", result, expected)
+		expected := now.Add(24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(24h) = %v, want approximately %v", result, expected)
 		}
 	})
 
-	t.Run("weekly reset", func(t *testing.T) {
+	t.Run("daily alias", func(t *testing.T) {
+		result := calculateNextReset("daily")
+		expected := now.Add(24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(daily) = %v, want approximately %v", result, expected)
+		}
+	})
+
+	t.Run("weekly reset (7d)", func(t *testing.T) {
 		result := calculateNextReset("7d")
-		// Should be next Monday at midnight
-		if result.Weekday() != time.Monday {
-			t.Errorf("calculateNextReset(7d) weekday = %v, want Monday", result.Weekday())
+		expected := now.Add(7 * 24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(7d) = %v, want approximately %v", result, expected)
 		}
 		if result.Before(now) {
 			t.Errorf("calculateNextReset(7d) = %v, should be in the future", result)
 		}
 	})
 
-	t.Run("monthly reset", func(t *testing.T) {
+	t.Run("weekly alias", func(t *testing.T) {
+		result := calculateNextReset("weekly")
+		expected := now.Add(7 * 24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(weekly) = %v, want approximately %v", result, expected)
+		}
+	})
+
+	t.Run("monthly reset (30d)", func(t *testing.T) {
 		result := calculateNextReset("30d")
-		// Should be 1st of next month at midnight
-		if result.Day() != 1 {
-			t.Errorf("calculateNextReset(30d) day = %d, want 1", result.Day())
+		expected := now.Add(30 * 24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(30d) = %v, want approximately %v", result, expected)
 		}
 		if result.Before(now) {
 			t.Errorf("calculateNextReset(30d) = %v, should be in the future", result)
+		}
+	})
+
+	t.Run("monthly alias", func(t *testing.T) {
+		result := calculateNextReset("monthly")
+		expected := now.Add(30 * 24 * time.Hour)
+		if diff := result.Sub(expected); diff < -tolerance || diff > tolerance {
+			t.Errorf("calculateNextReset(monthly) = %v, want approximately %v", result, expected)
 		}
 	})
 
@@ -201,6 +234,40 @@ func TestCalculateNextReset(t *testing.T) {
 			t.Errorf("calculateNextReset(invalid) = %v, want zero time", result)
 		}
 	})
+}
+
+func TestParseCustomDuration(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantDur time.Duration
+		wantOK  bool
+	}{
+		{"48h", 48 * time.Hour, true},
+		{"2d", 48 * time.Hour, true},
+		{"1d", 24 * time.Hour, true},
+		{"30m", 30 * time.Minute, true},
+		{"60s", 60 * time.Second, true},
+		{"7d", 7 * 24 * time.Hour, true},
+		{"30d", 30 * 24 * time.Hour, true},
+		// Invalid cases
+		{"", 0, false},
+		{"h", 0, false},
+		{"d", 0, false},
+		{"abc", 0, false},
+		{"1x", 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, ok := parseCustomDuration(tt.input)
+			if ok != tt.wantOK {
+				t.Errorf("parseCustomDuration(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if ok && got != tt.wantDur {
+				t.Errorf("parseCustomDuration(%q) = %v, want %v", tt.input, got, tt.wantDur)
+			}
+		})
+	}
 }
 
 func TestParseISOTime(t *testing.T) {
@@ -353,6 +420,16 @@ func TestFormatStatusLine(t *testing.T) {
 			expectColor:    ColorGreen,
 			expectContains: []string{"LiteLLM:", "reset:"},
 		},
+		{
+			name: "unknown budget duration shows unknown",
+			info: &KeyInfo{
+				Spend:          &spend25,
+				MaxBudget:      &budget100,
+				BudgetDuration: strPtr("badformat"),
+			},
+			expectColor:    ColorGreen,
+			expectContains: []string{"LiteLLM:", "reset: unknown"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -427,9 +504,56 @@ func TestGetEnvWithFallback(t *testing.T) {
 	}
 }
 
+func TestIsDebug(t *testing.T) {
+	t.Run("enabled with 1", func(t *testing.T) {
+		t.Setenv("LITELLM_DEBUG", "1")
+		if !isDebug() {
+			t.Error("expected isDebug() = true when LITELLM_DEBUG=1")
+		}
+	})
+	t.Run("enabled with true", func(t *testing.T) {
+		t.Setenv("LITELLM_DEBUG", "true")
+		if !isDebug() {
+			t.Error("expected isDebug() = true when LITELLM_DEBUG=true")
+		}
+	})
+	t.Run("disabled when unset", func(t *testing.T) {
+		t.Setenv("LITELLM_DEBUG", "")
+		if isDebug() {
+			t.Error("expected isDebug() = false when LITELLM_DEBUG is empty")
+		}
+	})
+	t.Run("disabled with 0", func(t *testing.T) {
+		t.Setenv("LITELLM_DEBUG", "0")
+		if isDebug() {
+			t.Error("expected isDebug() = false when LITELLM_DEBUG=0")
+		}
+	})
+}
+
+func TestIsBetaEnabled(t *testing.T) {
+	t.Run("enabled with 1", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_BETA_FEATURES", "1")
+		if !isBetaEnabled() {
+			t.Error("expected isBetaEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=1")
+		}
+	})
+	t.Run("enabled with true", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_BETA_FEATURES", "true")
+		if !isBetaEnabled() {
+			t.Error("expected isBetaEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=true")
+		}
+	})
+	t.Run("disabled when unset", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_BETA_FEATURES", "")
+		if isBetaEnabled() {
+			t.Error("expected isBetaEnabled() = false when unset")
+		}
+	})
+}
+
 func TestGetKeyInfoWithMockServer(t *testing.T) {
-	// Reset cache before test
-	resetCache()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
 	spend := 25.0
 	budget := 100.0
@@ -475,8 +599,8 @@ func TestGetKeyInfoWithMockServer(t *testing.T) {
 }
 
 func TestGetKeyInfoCaching(t *testing.T) {
-	// Reset cache before test
-	resetCache()
+	// Use a temp dir so the filesystem cache is fresh for this test
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
 	callCount := 0
 	spend := 25.0
@@ -497,26 +621,25 @@ func TestGetKeyInfoCaching(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	// First call
+	// First call — should hit API and write filesystem cache
 	_, err := getKeyInfo("test-token")
 	if err != nil {
 		t.Fatalf("first getKeyInfo() error = %v", err)
 	}
 
-	// Second call (should use cache)
+	// Second call — should read from filesystem cache, skip API
 	_, err = getKeyInfo("test-token")
 	if err != nil {
 		t.Fatalf("second getKeyInfo() error = %v", err)
 	}
 
 	if callCount != 1 {
-		t.Errorf("expected 1 API call (caching), got %d", callCount)
+		t.Errorf("expected 1 API call (filesystem caching), got %d", callCount)
 	}
 }
 
 func TestGetKeyInfoAuthError(t *testing.T) {
-	// Reset cache before test
-	resetCache()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -531,8 +654,42 @@ func TestGetKeyInfoAuthError(t *testing.T) {
 		t.Fatal("expected auth error, got nil")
 	}
 
-	if !strings.Contains(err.Error(), "auth error") {
-		t.Errorf("expected auth error, got %v", err)
+	if !errors.Is(err, ErrAuth) {
+		t.Errorf("expected ErrAuth, got %v", err)
+	}
+}
+
+func TestGetKeyInfoForbiddenError(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	_, err := getKeyInfo("bad-token")
+	if err == nil {
+		t.Fatal("expected auth error for 403, got nil")
+	}
+
+	if !errors.Is(err, ErrAuth) {
+		t.Errorf("expected ErrAuth for 403, got %v", err)
+	}
+}
+
+func TestFetchKeyInfoEmptyBaseURL(t *testing.T) {
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+
+	_, err := fetchKeyInfo("some-token")
+	if err == nil {
+		t.Fatal("expected error for empty baseURL, got nil")
+	}
+	if !strings.Contains(err.Error(), "no LiteLLM proxy URL") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
@@ -639,28 +796,73 @@ func TestFormatStatusLineNoUpdate(t *testing.T) {
 }
 
 func TestGetLatestVersionCaching(t *testing.T) {
-	resetUpdateCache()
+	// Use a temp dir so the filesystem cache is fresh for this test
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"tag_name":"v1.2.3"}`))
-	}))
-	defer server.Close()
+	// Write a version to the cache and verify readUpdateCache returns it
+	writeUpdateCache("v1.2.3")
 
-	// Override the fetch function by temporarily patching via test server
-	// We test caching by calling getLatestVersion twice and verifying the result
-	// (We can't easily override the URL constant, so we test fetchLatestVersion directly with a mock)
-	_ = server // used for the test pattern
-
-	// Test cache reset works
-	resetUpdateCache()
-	updateMutex.Lock()
-	if cachedLatestVersion != "" {
-		t.Error("expected empty cache after reset")
+	version, ok := readUpdateCache()
+	if !ok {
+		t.Fatal("expected readUpdateCache to return ok=true after write")
 	}
-	updateMutex.Unlock()
+	if version != "v1.2.3" {
+		t.Errorf("expected v1.2.3 from cache, got %q", version)
+	}
+}
+
+func TestUpdateCacheExpiry(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", tmpDir)
+
+	// Write a stale cache entry (timestamp 2 hours in the past, beyond the 1h TTL)
+	staleEntry := UpdateCacheEntry{
+		Timestamp:     time.Now().Add(-2 * time.Hour).UnixMilli(),
+		LatestVersion: "v1.0.0",
+	}
+	staleData, err := json.Marshal(staleEntry)
+	if err != nil {
+		t.Fatalf("failed to marshal stale entry: %v", err)
+	}
+	if mkErr := os.MkdirAll(cacheDir(), 0o755); mkErr != nil {
+		t.Fatalf("failed to create cache dir: %v", mkErr)
+	}
+	if wErr := os.WriteFile(updateCacheFile(), staleData, 0o600); wErr != nil {
+		t.Fatalf("failed to write stale cache: %v", wErr)
+	}
+
+	// Should be rejected as stale
+	_, ok := readUpdateCache()
+	if ok {
+		t.Error("expected readUpdateCache to return ok=false for stale cache")
+	}
+}
+
+func TestBudgetCacheReadWrite(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	spend := 42.0
+	budget := 100.0
+	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+
+	// Nothing in cache yet
+	_, ok := readBudgetCache()
+	if ok {
+		t.Error("expected readBudgetCache to return ok=false with empty cache")
+	}
+
+	// Write and read back
+	writeBudgetCache(info)
+	got, ok := readBudgetCache()
+	if !ok {
+		t.Fatal("expected readBudgetCache to return ok=true after write")
+	}
+	if got.Spend == nil || *got.Spend != 42.0 {
+		t.Errorf("expected spend = 42.0, got %v", got.Spend)
+	}
+	if got.MaxBudget == nil || *got.MaxBudget != 100.0 {
+		t.Errorf("expected budget = 100.0, got %v", got.MaxBudget)
+	}
 }
 
 func TestZeroBudgetDivision(t *testing.T) {
@@ -769,6 +971,8 @@ func TestCalculateBudgetPeriod(t *testing.T) {
 		{"daily", "1d", 24 * time.Hour, 24 * time.Hour, true},
 		{"weekly", "7d", 7 * 24 * time.Hour, 7 * 24 * time.Hour, true},
 		{"custom 48h", "48h", 48 * time.Hour, 48 * time.Hour, true},
+		{"monthly alias", "monthly", 30 * 24 * time.Hour, 30 * 24 * time.Hour, true},
+		{"weekly alias", "weekly", 7 * 24 * time.Hour, 7 * 24 * time.Hour, true},
 		{"nil duration", "", 0, 0, false},
 		{"invalid duration", "invalid", 0, 0, false},
 	}

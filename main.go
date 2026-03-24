@@ -2,13 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -29,45 +30,25 @@ const (
 
 // Cache configuration
 const (
-	CacheTTLMs         = 30_000 // 30 seconds in milliseconds
-	HTTPTimeout        = 10 * time.Second
-	MaxRetries         = 3
-	InitialBackoffMs   = 1_000           // 1 second
-	CooldownMs         = 5 * 60 * 1_000  // 5 minutes in milliseconds
+	CacheTTLMs         = 30_000          // 30 seconds in milliseconds
+	HTTPTimeout        = 3 * time.Second // fast failure for subprocess/statusline use
 	UpdateCheckTTLMs   = 60 * 60 * 1_000 // 1 hour in milliseconds
 	UpdateCheckTimeout = 5 * time.Second
 )
 
-// Cache for budget info
-var (
-	cachedBudgetInfo *KeyInfo
-	cacheTimestamp   int64
-	cooldownUntil    int64
-	cacheMutex       sync.Mutex
-)
+// ErrAuth is returned when the API responds with a 401 or 403 status.
+var ErrAuth = errors.New("auth error")
 
-// Cache for update check
-var (
-	cachedLatestVersion  string
-	updateCacheTimestamp int64
-	updateMutex          sync.Mutex
-)
-
-// resetCache clears all cache state (exported for testing)
-func resetCache() {
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
-	cachedBudgetInfo = nil
-	cacheTimestamp = 0
-	cooldownUntil = 0
+// BudgetCacheEntry is the on-disk representation of a cached budget API response.
+type BudgetCacheEntry struct {
+	Timestamp int64   `json:"timestamp"` // Unix milliseconds
+	Info      KeyInfo `json:"info"`
 }
 
-// resetUpdateCache clears the update check cache (for testing)
-func resetUpdateCache() {
-	updateMutex.Lock()
-	defer updateMutex.Unlock()
-	cachedLatestVersion = ""
-	updateCacheTimestamp = 0
+// UpdateCacheEntry is the on-disk representation of a cached GitHub version check.
+type UpdateCacheEntry struct {
+	Timestamp     int64  `json:"timestamp"` // Unix milliseconds
+	LatestVersion string `json:"latest_version"`
 }
 
 // KeyInfoResponse represents the API response structure
@@ -86,6 +67,98 @@ type KeyInfo struct {
 // GitHubRelease represents the GitHub releases API response
 type GitHubRelease struct {
 	TagName string `json:"tag_name"`
+}
+
+// cacheDir returns the directory used for filesystem caching.
+// Respects XDG_CACHE_HOME; falls back to $HOME/.cache.
+func cacheDir() string {
+	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "claude-code-litellm")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "claude-code-litellm")
+}
+
+func budgetCacheFile() string {
+	return filepath.Join(cacheDir(), "budget.json")
+}
+
+func updateCacheFile() string {
+	return filepath.Join(cacheDir(), "update.json")
+}
+
+// readBudgetCache reads cached budget info from disk.
+// Returns nil, false if the cache is missing, corrupt, or older than CacheTTLMs.
+func readBudgetCache() (*KeyInfo, bool) {
+	data, err := os.ReadFile(budgetCacheFile())
+	if err != nil {
+		return nil, false
+	}
+	var entry BudgetCacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, false
+	}
+	if time.Now().UnixMilli()-entry.Timestamp >= CacheTTLMs {
+		return nil, false
+	}
+	return &entry.Info, true
+}
+
+// writeBudgetCache writes budget info to the filesystem cache.
+// Errors are silently ignored — caching is best-effort.
+func writeBudgetCache(info *KeyInfo) {
+	if info == nil {
+		return
+	}
+	entry := BudgetCacheEntry{
+		Timestamp: time.Now().UnixMilli(),
+		Info:      *info,
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(budgetCacheFile(), data, 0o600)
+}
+
+// readUpdateCache reads the cached latest GitHub release version from disk.
+// Returns "", false if the cache is missing, corrupt, or older than UpdateCheckTTLMs.
+func readUpdateCache() (string, bool) {
+	data, err := os.ReadFile(updateCacheFile())
+	if err != nil {
+		return "", false
+	}
+	var entry UpdateCacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return "", false
+	}
+	if time.Now().UnixMilli()-entry.Timestamp >= UpdateCheckTTLMs {
+		return "", false
+	}
+	return entry.LatestVersion, true
+}
+
+// writeUpdateCache persists the latest version string to disk.
+// Errors are silently ignored — caching is best-effort.
+func writeUpdateCache(version string) {
+	if version == "" {
+		return
+	}
+	entry := UpdateCacheEntry{
+		Timestamp:     time.Now().UnixMilli(),
+		LatestVersion: version,
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(updateCacheFile(), data, 0o600)
 }
 
 // fetchLatestVersion calls the GitHub releases API to get the latest release tag
@@ -117,22 +190,17 @@ func fetchLatestVersion() string {
 	return release.TagName
 }
 
-// getLatestVersion returns the latest GitHub release tag, using a 1-hour cache
+// getLatestVersion returns the latest GitHub release tag, using a 1-hour filesystem cache.
+// Each invocation is a fresh process, so the cache must live on disk.
 func getLatestVersion() string {
-	updateMutex.Lock()
-	defer updateMutex.Unlock()
-
-	now := time.Now().UnixMilli()
-	if cachedLatestVersion != "" && (now-updateCacheTimestamp) < UpdateCheckTTLMs {
-		return cachedLatestVersion
+	if version, ok := readUpdateCache(); ok {
+		return version
 	}
-
 	latest := fetchLatestVersion()
 	if latest != "" {
-		cachedLatestVersion = latest
-		updateCacheTimestamp = now
+		writeUpdateCache(latest)
 	}
-	return cachedLatestVersion
+	return latest
 }
 
 // semverGreater returns true if version a is greater than version b.
@@ -197,52 +265,27 @@ func isBetaEnabled() bool {
 	return val == "1" || val == "true"
 }
 
-// getKeyInfo fetches budget info from the LiteLLM API with caching and exponential backoff
+// getKeyInfo fetches budget info from the LiteLLM API, using a 30-second filesystem cache
+// to avoid hitting the API on every statusline refresh.
+// Each invocation of this binary is a fresh process, so all state must live on disk.
 func getKeyInfo(apiKey string) (*KeyInfo, error) {
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
-
-	now := time.Now().UnixMilli()
-
-	// Check if we're in cooldown period
-	if cooldownUntil > 0 && now < cooldownUntil {
-		return nil, fmt.Errorf("cooldown")
+	if info, ok := readBudgetCache(); ok {
+		return info, nil
 	}
-
-	// Return cached data if still valid
-	if cachedBudgetInfo != nil && (now-cacheTimestamp) < CacheTTLMs {
-		return cachedBudgetInfo, nil
+	info, err := fetchKeyInfo(apiKey)
+	if err != nil {
+		return nil, err
 	}
-
-	// Try to fetch with exponential backoff
-	var lastErr error
-	for attempt := 0; attempt <= MaxRetries; attempt++ {
-		if attempt > 0 {
-			// Calculate exponential backoff delay
-			backoffMs := InitialBackoffMs * (1 << (attempt - 1)) // 1s, 2s, 4s
-			time.Sleep(time.Duration(backoffMs) * time.Millisecond)
-		}
-
-		info, err := fetchKeyInfo(apiKey)
-		if err == nil {
-			// Success - cache result and clear cooldown
-			cachedBudgetInfo = info
-			cacheTimestamp = now
-			cooldownUntil = 0
-			return info, nil
-		}
-
-		lastErr = err
-	}
-
-	// All retries failed - enter cooldown
-	cooldownUntil = now + CooldownMs
-	return nil, lastErr
+	writeBudgetCache(info)
+	return info, nil
 }
 
 // fetchKeyInfo makes the actual API call
 func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 	baseURL := getBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("no LiteLLM proxy URL configured (set LITELLM_PROXY_URL or ANTHROPIC_BASE_URL)")
+	}
 	url := baseURL + "/key/info"
 
 	client := &http.Client{Timeout: HTTPTimeout}
@@ -266,7 +309,7 @@ func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 	}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("auth error: status=%d url=%s body=%s", resp.StatusCode, url, string(body))
+		return nil, fmt.Errorf("status=%d url=%s body=%s: %w", resp.StatusCode, url, string(body), ErrAuth)
 	}
 
 	if resp.StatusCode != 200 {
@@ -302,52 +345,29 @@ func parseISOTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse time: %s", s)
 }
 
-// calculateNextReset calculates the next reset time based on budget_duration
-// Supports formats like "30d", "7d", "1d", "24h", etc.
-// Returns the next reset time according to LiteLLM's reset rules:
-// - Daily (24h/1d): Reset at midnight every day
-// - Weekly (7d): Reset on Monday at midnight
-// - Monthly (30d): Reset on the 1st of each month at midnight
-func calculateNextReset(duration string) time.Time {
-	now := time.Now().UTC()
-
-	// Parse duration string (e.g., "30d", "7d", "1d", "24h")
-	duration = strings.TrimSpace(strings.ToLower(duration))
-
-	switch duration {
-	case "30d", "1mo", "monthly":
-		// Monthly: Reset on 1st of next month at midnight
-		year, month, _ := now.Date()
-		nextMonth := month + 1
-		nextYear := year
-		if nextMonth > 12 {
-			nextMonth = 1
-			nextYear++
-		}
-		return time.Date(nextYear, nextMonth, 1, 0, 0, 0, 0, time.UTC)
-
-	case "7d", "weekly":
-		// Weekly: Reset on next Monday at midnight
-		daysUntilMonday := (8 - int(now.Weekday())) % 7
-		if daysUntilMonday == 0 {
-			daysUntilMonday = 7 // If today is Monday, next reset is next Monday
-		}
-		nextMonday := now.AddDate(0, 0, daysUntilMonday)
-		return time.Date(nextMonday.Year(), nextMonday.Month(), nextMonday.Day(), 0, 0, 0, 0, time.UTC)
-
-	case "1d", "24h", "daily":
-		// Daily: Reset at next midnight
-		tomorrow := now.AddDate(0, 0, 1)
-		return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 0, 0, 0, 0, time.UTC)
-
+// normalizeDuration maps named duration aliases to their canonical day/hour form.
+func normalizeDuration(duration string) string {
+	switch strings.TrimSpace(strings.ToLower(duration)) {
+	case "monthly", "1mo":
+		return "30d"
+	case "weekly":
+		return "7d"
+	case "daily":
+		return "1d"
 	default:
-		// Try to parse as a custom duration (e.g., "48h", "2d")
-		if d, ok := parseCustomDuration(duration); ok {
-			return now.Add(d)
-		}
-		// Fallback: return zero time (will show "unknown")
-		return time.Time{}
+		return strings.TrimSpace(strings.ToLower(duration))
 	}
+}
+
+// calculateNextReset calculates when the budget will next reset.
+// Returns now + duration as a rolling window, matching LiteLLM's actual reset behavior.
+// Returns zero time if the duration format is unrecognized.
+func calculateNextReset(duration string) time.Time {
+	normalized := normalizeDuration(duration)
+	if d, ok := parseCustomDuration(normalized); ok {
+		return time.Now().UTC().Add(d)
+	}
+	return time.Time{}
 }
 
 // formatDuration formats a time.Duration as a human-readable string
@@ -387,8 +407,9 @@ func getDurationLabel(duration string) string {
 	}
 }
 
-// formatTimeUntilReset formats the time remaining until budget reset
-// Returns (timeString, durationLabel)
+// formatTimeUntilReset formats the time remaining until budget reset.
+// Returns (timeString, durationLabel). timeString is "unknown" if the duration
+// format is present but unrecognized.
 func formatTimeUntilReset(resetAt *string, budgetDuration *string) (string, string) {
 	now := time.Now().UTC()
 	var durationLabel string
@@ -411,6 +432,8 @@ func formatTimeUntilReset(resetAt *string, budgetDuration *string) (string, stri
 		if !nextReset.IsZero() {
 			return formatDuration(nextReset.Sub(now)), durationLabel
 		}
+		// Duration is set but format is unrecognized — tell the user
+		return "unknown", durationLabel
 	}
 
 	return "", ""
@@ -459,7 +482,11 @@ func calculateBudgetPeriod(keyInfo *KeyInfo) (time.Time, time.Time, bool) {
 		return time.Time{}, time.Time{}, false
 	}
 
-	duration := strings.TrimSpace(strings.ToLower(*keyInfo.BudgetDuration))
+	normalized := normalizeDuration(*keyInfo.BudgetDuration)
+	d, ok := parseCustomDuration(normalized)
+	if !ok {
+		return time.Time{}, time.Time{}, false
+	}
 
 	// Determine period end
 	var periodEnd time.Time
@@ -469,29 +496,10 @@ func calculateBudgetPeriod(keyInfo *KeyInfo) (time.Time, time.Time, bool) {
 		}
 	}
 	if periodEnd.IsZero() {
-		periodEnd = calculateNextReset(*keyInfo.BudgetDuration)
-		if periodEnd.IsZero() {
-			return time.Time{}, time.Time{}, false
-		}
+		periodEnd = time.Now().UTC().Add(d)
 	}
 
-	// Determine period start based on duration type
-	var periodStart time.Time
-	switch duration {
-	case "30d", "1mo", "monthly":
-		periodStart = periodEnd.AddDate(0, -1, 0)
-	case "7d", "weekly":
-		periodStart = periodEnd.AddDate(0, 0, -7)
-	case "1d", "24h", "daily":
-		periodStart = periodEnd.AddDate(0, 0, -1)
-	default:
-		if d, ok := parseCustomDuration(duration); ok {
-			periodStart = periodEnd.Add(-d)
-		} else {
-			return time.Time{}, time.Time{}, false
-		}
-	}
-
+	periodStart := periodEnd.Add(-d)
 	return periodStart, periodEnd, true
 }
 
@@ -653,26 +661,25 @@ func main() {
 
 	info, err := getKeyInfo(token)
 	if err != nil {
-		errStr := err.Error()
 		debug := isDebug()
-
-		if strings.Contains(errStr, "cooldown") {
-			fmt.Println(formatError("Cooldown (retrying in 5m)"))
-		} else if strings.Contains(errStr, "auth error") {
+		switch {
+		case errors.Is(err, ErrAuth):
 			if debug {
-				fmt.Println(formatError("Auth error: " + errStr))
+				fmt.Println(formatError("Auth error: " + err.Error()))
 			} else {
 				fmt.Println(formatError("Auth error"))
 			}
-		} else if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "connection") || strings.Contains(errStr, "dial") {
+		case strings.Contains(err.Error(), "timeout") ||
+			strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "dial"):
 			if debug {
-				fmt.Println(formatError("Connection error: " + errStr))
+				fmt.Println(formatError("Connection error: " + err.Error()))
 			} else {
 				fmt.Println(formatError("Connection error"))
 			}
-		} else {
+		default:
 			if debug {
-				fmt.Println(formatError("Error: " + errStr))
+				fmt.Println(formatError("Error: " + err.Error()))
 			} else {
 				fmt.Println(formatError("Error"))
 			}
