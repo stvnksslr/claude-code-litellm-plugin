@@ -341,10 +341,10 @@ func calculateNextReset(duration string) time.Time {
 		return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 0, 0, 0, 0, time.UTC)
 
 	default:
-        // Try to parse as a custom duration (e.g., "48h", "2d")
-        if d, ok := parseCustomDuration(duration); ok {
-          return now.Add(d)
-        }
+		// Try to parse as a custom duration (e.g., "48h", "2d")
+		if d, ok := parseCustomDuration(duration); ok {
+			return now.Add(d)
+		}
 		// Fallback: return zero time (will show "unknown")
 		return time.Time{}
 	}
@@ -586,7 +586,6 @@ func renderProgressBar(percent float64, elapsedFraction float64, hasTimeInfo boo
 	return buf.String()
 }
 
-
 // formatStatusLine formats the budget info as a colored progress bar.
 // latestVersion is the latest GitHub release tag (empty string to skip update notice).
 func formatStatusLine(info *KeyInfo, latestVersion string) string {
@@ -632,7 +631,7 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 		line += " " + progressBar
 	}
 
-    line += updateStr + resetStr
+	line += updateStr + resetStr
 
 	return line
 }
