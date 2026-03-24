@@ -680,6 +680,38 @@ func TestGetKeyInfoForbiddenError(t *testing.T) {
 	}
 }
 
+func TestGetKeyInfoBudgetExceeded(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Budget has been exceeded! Current cost: 78.99, Max budget: 65.0","type":"budget_exceeded","param":null,"code":"400"}}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	_, err := getKeyInfo("some-token")
+	if err == nil {
+		t.Fatal("expected budget exceeded error, got nil")
+	}
+	if !errors.Is(err, ErrBudgetExceeded) {
+		t.Errorf("expected ErrBudgetExceeded, got %v", err)
+	}
+
+	var bErr *BudgetExceededError
+	if !errors.As(err, &bErr) {
+		t.Fatal("expected error to be *BudgetExceededError")
+	}
+	if bErr.Spend != 78.99 {
+		t.Errorf("expected Spend=78.99, got %v", bErr.Spend)
+	}
+	if bErr.MaxBudget != 65.0 {
+		t.Errorf("expected MaxBudget=65.0, got %v", bErr.MaxBudget)
+	}
+}
+
 func TestFetchKeyInfoEmptyBaseURL(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", "")

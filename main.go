@@ -39,6 +39,29 @@ const (
 // ErrAuth is returned when the API responds with a 401 or 403 status.
 var ErrAuth = errors.New("auth error")
 
+// ErrBudgetExceeded is returned when the API reports the key's budget has been exceeded.
+var ErrBudgetExceeded = errors.New("budget exceeded")
+
+// BudgetExceededError wraps ErrBudgetExceeded with the spend/budget values parsed from the error message.
+type BudgetExceededError struct {
+	Spend     float64
+	MaxBudget float64
+}
+
+func (e *BudgetExceededError) Error() string { return ErrBudgetExceeded.Error() }
+func (e *BudgetExceededError) Is(target error) bool {
+	return target == ErrBudgetExceeded
+}
+func (e *BudgetExceededError) Unwrap() error { return ErrBudgetExceeded }
+
+// liteLLMError is the error envelope returned by LiteLLM on non-2xx responses.
+type liteLLMError struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
+}
+
 // BudgetCacheEntry is the on-disk representation of a cached budget API response.
 type BudgetCacheEntry struct {
 	Timestamp int64   `json:"timestamp"` // Unix milliseconds
@@ -313,6 +336,12 @@ func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 	}
 
 	if resp.StatusCode != 200 {
+		var litellmErr liteLLMError
+		if json.Unmarshal(body, &litellmErr) == nil && litellmErr.Error.Type == "budget_exceeded" {
+			bErr := &BudgetExceededError{}
+			_, _ = fmt.Sscanf(litellmErr.Error.Message, "Budget has been exceeded! Current cost: %f, Max budget: %f", &bErr.Spend, &bErr.MaxBudget)
+			return nil, bErr
+		}
 		return nil, fmt.Errorf("HTTP error: status=%d url=%s body=%s", resp.StatusCode, url, string(body))
 	}
 
@@ -668,6 +697,15 @@ func main() {
 	if err != nil {
 		debug := isDebug()
 		switch {
+		case errors.Is(err, ErrBudgetExceeded):
+			var bErr *BudgetExceededError
+			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
+				percent := (bErr.Spend / bErr.MaxBudget) * 100
+				fmt.Printf("%sLiteLLM: $%.2f/$%.2f (%.0f%%) | Budget exceeded%s\n",
+					ColorRed, bErr.Spend, bErr.MaxBudget, percent, ColorReset)
+			} else {
+				fmt.Println(formatError("Budget exceeded"))
+			}
 		case errors.Is(err, ErrAuth):
 			if debug {
 				fmt.Println(formatError("Auth error: " + err.Error()))
