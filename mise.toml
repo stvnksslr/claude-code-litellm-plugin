@@ -1,2 +1,55 @@
 [tools]
 go = "1.26.1"
+
+[tasks.build]
+description = "Build for the current platform"
+run = "go build -o claude-code-litellm-plugin ."
+
+[tasks.test]
+description = "Run tests"
+run = "go test -v ./..."
+
+[tasks.lint]
+description = "Run all linters (fmt, mod tidy, golangci-lint)"
+run = """
+if [ -n "$(gofmt -l .)" ]; then
+  echo "Code is not formatted. Run 'go fmt ./...'"
+  gofmt -d .
+  exit 1
+fi
+go mod tidy
+if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
+  echo "go.mod or go.sum is not tidy. Run 'go mod tidy'"
+  git diff go.mod go.sum
+  exit 1
+fi
+golangci-lint run
+"""
+
+[tasks."build:multi"]
+description = "Build for all CI/CD release targets (linux/darwin/windows x amd64/arm64/386)"
+run = """
+set -e
+GOOS_LIST="linux darwin windows"
+GOARCH_LIST="amd64 arm64 386"
+OUT=dist
+
+rm -rf $OUT && mkdir -p $OUT
+
+for OS in $GOOS_LIST; do
+  for ARCH in $GOARCH_LIST; do
+    # goreleaser skips darwin/386
+    if [ "$OS" = "darwin" ] && [ "$ARCH" = "386" ]; then continue; fi
+
+    EXT=""
+    if [ "$OS" = "windows" ]; then EXT=".exe"; fi
+
+    OUT_FILE="$OUT/claude-code-litellm-plugin_${OS}_${ARCH}${EXT}"
+    echo "Building $OUT_FILE..."
+    GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -o "$OUT_FILE" .
+  done
+done
+
+echo "Done. Binaries in $OUT/:"
+ls $OUT/
+"""
