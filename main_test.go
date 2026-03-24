@@ -533,21 +533,33 @@ func TestIsDebug(t *testing.T) {
 
 func TestIsBetaEnabled(t *testing.T) {
 	t.Run("enabled with 1", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_BETA_FEATURES", "1")
-		if !isBetaEnabled() {
-			t.Error("expected isBetaEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=1")
+		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "1")
+		if !isProgressBarEnabled() {
+			t.Error("expected isProgressBarEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=1")
 		}
 	})
 	t.Run("enabled with true", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_BETA_FEATURES", "true")
-		if !isBetaEnabled() {
-			t.Error("expected isBetaEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=true")
+		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "true")
+		if !isProgressBarEnabled() {
+			t.Error("expected isProgressBarEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=true")
 		}
 	})
 	t.Run("disabled when unset", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_BETA_FEATURES", "")
-		if isBetaEnabled() {
-			t.Error("expected isBetaEnabled() = false when unset")
+		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "")
+		if !isProgressBarEnabled() {
+			t.Error("expected isProgressBarEnabled() = true when unset")
+		}
+	})
+	t.Run("disabled with 0", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "0")
+		if isProgressBarEnabled() {
+			t.Error("expected isProgressBarEnabled() = false when LITELLM_PLUGIN_BETA_FEATURES=0")
+		}
+	})
+	t.Run("disabled with false", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "false")
+		if isProgressBarEnabled() {
+			t.Error("expected isProgressBarEnabled() = false when LITELLM_PLUGIN_BETA_FEATURES=false")
 		}
 	})
 }
