@@ -259,10 +259,10 @@ func isDebug() bool {
 	return val == "1" || val == "true"
 }
 
-// isBetaEnabled returns true if beta features are enabled via LITELLM_PLUGIN_BETA_FEATURES environment variable
-func isBetaEnabled() bool {
-	val := os.Getenv("LITELLM_PLUGIN_BETA_FEATURES")
-	return val == "1" || val == "true"
+// isProgressBarEnabled returns true if beta features are enabled via LITELLM_PLUGIN_BETA_FEATURES environment variable
+func isProgressBarEnabled() bool {
+	val := os.Getenv("LITELLM_PLUGIN_PROGRESS_BAR")
+	return val == "1" || val == "true" || val == ""
 }
 
 // getKeyInfo fetches budget info from the LiteLLM API, using a 30-second filesystem cache
@@ -633,7 +633,7 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 
 	line := fmt.Sprintf("%sLiteLLM: %s (%.0f%%)%s", absColor, budgetStr, percent, ColorReset)
 
-	if isBetaEnabled() {
+	if isProgressBarEnabled() {
 		elapsedFraction, hasTimeInfo := calculateElapsedFraction(info)
 		progressBar := renderProgressBar(percent, elapsedFraction, hasTimeInfo)
 		line += " " + progressBar
