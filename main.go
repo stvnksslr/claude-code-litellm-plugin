@@ -650,6 +650,11 @@ func formatError(msg string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Println(Version)
+		return
+	}
+
 	// Consume stdin (Claude Code sends session data, but we don't use it)
 	_, _ = io.ReadAll(os.Stdin)
 
