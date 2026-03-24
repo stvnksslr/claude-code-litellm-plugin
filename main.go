@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -190,6 +191,12 @@ func isDebug() bool {
 	return val == "1" || val == "true"
 }
 
+// isBetaEnabled returns true if beta features are enabled via LITELLM_PLUGIN_BETA_FEATURES environment variable
+func isBetaEnabled() bool {
+	val := os.Getenv("LITELLM_PLUGIN_BETA_FEATURES")
+	return val == "1" || val == "true"
+}
+
 // getKeyInfo fetches budget info from the LiteLLM API with caching and exponential backoff
 func getKeyInfo(apiKey string) (*KeyInfo, error) {
 	cacheMutex.Lock()
@@ -334,23 +341,9 @@ func calculateNextReset(duration string) time.Time {
 		return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 0, 0, 0, 0, time.UTC)
 
 	default:
-		// Try to parse as a duration with suffix (e.g., "48h", "2d")
-		if len(duration) > 1 {
-			suffix := duration[len(duration)-1]
-			valueStr := duration[:len(duration)-1]
-			var value int
-			if _, err := fmt.Sscanf(valueStr, "%d", &value); err == nil {
-				switch suffix {
-				case 'd':
-					return now.AddDate(0, 0, value)
-				case 'h':
-					return now.Add(time.Duration(value) * time.Hour)
-				case 'm':
-					return now.Add(time.Duration(value) * time.Minute)
-				case 's':
-					return now.Add(time.Duration(value) * time.Second)
-				}
-			}
+		// Try to parse as a custom duration (e.g., "48h", "2d")
+		if d, ok := parseCustomDuration(duration); ok {
+			return now.Add(d)
 		}
 		// Fallback: return zero time (will show "unknown")
 		return time.Time{}
@@ -423,7 +416,177 @@ func formatTimeUntilReset(resetAt *string, budgetDuration *string) (string, stri
 	return "", ""
 }
 
-// formatStatusLine formats the budget info as a colored status line.
+// budgetColor returns the ANSI color code for a budget usage percentage.
+func budgetColor(percent float64) string {
+	if percent >= 90 {
+		return ColorRed
+	}
+	if percent >= 75 {
+		return ColorYellow
+	}
+	return ColorGreen
+}
+
+// parseCustomDuration parses a duration string like "48h", "2d" into time.Duration
+func parseCustomDuration(duration string) (time.Duration, bool) {
+	if len(duration) < 2 {
+		return 0, false
+	}
+	suffix := duration[len(duration)-1]
+	valueStr := duration[:len(duration)-1]
+	var value int
+	if _, err := fmt.Sscanf(valueStr, "%d", &value); err != nil {
+		return 0, false
+	}
+	switch suffix {
+	case 'd':
+		return time.Duration(value) * 24 * time.Hour, true
+	case 'h':
+		return time.Duration(value) * time.Hour, true
+	case 'm':
+		return time.Duration(value) * time.Minute, true
+	case 's':
+		return time.Duration(value) * time.Second, true
+	}
+	return 0, false
+}
+
+// calculateBudgetPeriod returns the start and end of the current budget period.
+// Requires BudgetDuration to determine period length.
+// If BudgetResetAt is set, it overrides the calculated period end.
+func calculateBudgetPeriod(keyInfo *KeyInfo) (time.Time, time.Time, bool) {
+	if keyInfo.BudgetDuration == nil || *keyInfo.BudgetDuration == "" {
+		return time.Time{}, time.Time{}, false
+	}
+
+	duration := strings.TrimSpace(strings.ToLower(*keyInfo.BudgetDuration))
+
+	// Determine period end
+	var periodEnd time.Time
+	if keyInfo.BudgetResetAt != nil && *keyInfo.BudgetResetAt != "" {
+		if t, err := parseISOTime(*keyInfo.BudgetResetAt); err == nil {
+			periodEnd = t
+		}
+	}
+	if periodEnd.IsZero() {
+		periodEnd = calculateNextReset(*keyInfo.BudgetDuration)
+		if periodEnd.IsZero() {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+
+	// Determine period start based on duration type
+	var periodStart time.Time
+	switch duration {
+	case "30d", "1mo", "monthly":
+		periodStart = periodEnd.AddDate(0, -1, 0)
+	case "7d", "weekly":
+		periodStart = periodEnd.AddDate(0, 0, -7)
+	case "1d", "24h", "daily":
+		periodStart = periodEnd.AddDate(0, 0, -1)
+	default:
+		if d, ok := parseCustomDuration(duration); ok {
+			periodStart = periodEnd.Add(-d)
+		} else {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+
+	return periodStart, periodEnd, true
+}
+
+// calculateElapsedFraction returns what fraction of the current budget period has elapsed (0.0–1.0).
+func calculateElapsedFraction(keyInfo *KeyInfo) (float64, bool) {
+	periodStart, periodEnd, ok := calculateBudgetPeriod(keyInfo)
+	if !ok {
+		return 0, false
+	}
+
+	now := time.Now().UTC()
+	total := periodEnd.Sub(periodStart)
+	elapsed := now.Sub(periodStart)
+
+	if total <= 0 {
+		return 0, false
+	}
+
+	fraction := elapsed.Seconds() / total.Seconds()
+	// Clamp to [0.0, 1.0] to handle edge cases like clock skew
+	if fraction < 0 {
+		fraction = 0
+	} else if fraction > 1.0 {
+		fraction = 1.0
+	}
+	return fraction, true
+}
+
+// renderProgressBar renders a 20-character progress bar with optional pace marker.
+// Fill color is based on absolute spend thresholds.
+// Marker color is based on projected end-of-period usage.
+func renderProgressBar(percent float64, elapsedFraction float64, hasTimeInfo bool) string {
+	const barWidth = 20
+
+	fillWidth := int(math.Round(percent / 100.0 * float64(barWidth)))
+	if fillWidth > barWidth {
+		fillWidth = barWidth
+	}
+	if fillWidth < 0 {
+		fillWidth = 0
+	}
+
+	markerPos := -1
+	if hasTimeInfo {
+		markerPos = int(math.Round(elapsedFraction * float64(barWidth)))
+		if markerPos >= barWidth {
+			markerPos = barWidth - 1
+		}
+		if markerPos < 0 {
+			markerPos = 0
+		}
+	}
+
+	// Absolute color for fill
+	absColor := budgetColor(percent)
+
+	// Pace color for marker
+	paceColor := absColor
+	if hasTimeInfo && elapsedFraction > 0.03 && elapsedFraction < 1.0 {
+		projected := percent / elapsedFraction
+		if projected > 100 {
+			paceColor = ColorRed
+		} else if projected >= 75 {
+			paceColor = ColorYellow
+		} else {
+			paceColor = ColorGreen
+		}
+	}
+
+	var buf strings.Builder
+	buf.WriteString("[")
+
+	lastColor := ""
+	for i := 0; i < barWidth; i++ {
+		var color, char string
+		if i == markerPos {
+			color, char = paceColor, "│"
+		} else if i < fillWidth {
+			color, char = absColor, "█"
+		} else {
+			color, char = ColorGray, "░"
+		}
+		if color != lastColor {
+			buf.WriteString(color)
+			lastColor = color
+		}
+		buf.WriteString(char)
+	}
+
+	buf.WriteString(ColorReset)
+	buf.WriteString("]")
+	return buf.String()
+}
+
+// formatStatusLine formats the budget info as a colored progress bar.
 // latestVersion is the latest GitHub release tag (empty string to skip update notice).
 func formatStatusLine(info *KeyInfo, latestVersion string) string {
 	spend := 0.0
@@ -431,46 +594,46 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 		spend = *info.Spend
 	}
 
-	var color string
-	var budgetStr string
-	var percentStr string
-
-	if info.MaxBudget != nil && *info.MaxBudget > 0 {
-		budget := *info.MaxBudget
-		percent := (spend / budget) * 100
-
-		if percent >= 90 {
-			color = ColorRed
-		} else if percent >= 75 {
-			color = ColorYellow
-		} else {
-			color = ColorGreen
-		}
-
-		budgetStr = fmt.Sprintf("$%.2f/$%.2f", spend, budget)
-		percentStr = fmt.Sprintf(" (%.0f%%)", percent)
-	} else {
-		color = ColorGreen
-		budgetStr = fmt.Sprintf("$%.2f", spend)
-		percentStr = ""
-	}
-
-	resetStr := ""
-	resetTime, durationLabel := formatTimeUntilReset(info.BudgetResetAt, info.BudgetDuration)
-	if resetTime != "" {
-		if durationLabel != "" {
-			resetStr = fmt.Sprintf(" %s| %s reset: %s%s", ColorGray, durationLabel, resetTime, ColorReset)
-		} else {
-			resetStr = fmt.Sprintf(" %s| reset: %s%s", ColorGray, resetTime, ColorReset)
-		}
-	}
-
 	updateStr := ""
 	if isUpdateAvailable(Version, latestVersion) {
 		updateStr = fmt.Sprintf(" %s| update: %s%s", ColorYellow, latestVersion, ColorReset)
 	}
 
-	return fmt.Sprintf("%sLiteLLM: %s%s%s%s%s", color, budgetStr, percentStr, ColorReset, resetStr, updateStr)
+	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
+		// No budget set — just show spend
+		return fmt.Sprintf("%sLiteLLM: $%.2f%s%s", ColorGreen, spend, ColorReset, updateStr)
+	}
+
+	budget := *info.MaxBudget
+	percent := (spend / budget) * 100
+
+	// Absolute color for text
+	absColor := budgetColor(percent)
+
+	budgetStr := fmt.Sprintf("$%.2f/$%.2f", spend, budget)
+
+	// Reset info
+	resetStr := ""
+	resetTime, durationLabel := formatTimeUntilReset(info.BudgetResetAt, info.BudgetDuration)
+	if resetTime != "" {
+		if durationLabel != "" {
+			resetStr = fmt.Sprintf(" %s%s reset: %s%s", ColorGray, durationLabel, resetTime, ColorReset)
+		} else {
+			resetStr = fmt.Sprintf(" %s reset: %s%s", ColorGray, resetTime, ColorReset)
+		}
+	}
+
+	line := fmt.Sprintf("%sLiteLLM: %s (%.0f%%)%s", absColor, budgetStr, percent, ColorReset)
+
+	if isBetaEnabled() {
+		elapsedFraction, hasTimeInfo := calculateElapsedFraction(info)
+		progressBar := renderProgressBar(percent, elapsedFraction, hasTimeInfo)
+		line += " " + progressBar
+	}
+
+	line += updateStr + resetStr
+
+	return line
 }
 
 // formatError formats an error message with red color

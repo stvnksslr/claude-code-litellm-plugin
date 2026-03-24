@@ -680,3 +680,162 @@ func TestZeroBudgetDivision(t *testing.T) {
 		t.Errorf("expected result to contain spend, got %q", result)
 	}
 }
+
+func TestRenderProgressBar(t *testing.T) {
+	tests := []struct {
+		name            string
+		percent         float64
+		elapsedFraction float64
+		hasTimeInfo     bool
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name:            "partial fill without marker",
+			percent:         50,
+			hasTimeInfo:     false,
+			wantContains:    []string{"[", "]", "█", "░"},
+			wantNotContains: []string{"│"},
+		},
+		{
+			name:            "full fill at 100%",
+			percent:         100,
+			hasTimeInfo:     false,
+			wantContains:    []string{"█"},
+			wantNotContains: []string{"░"},
+		},
+		{
+			name:            "pace marker present with time info",
+			percent:         50,
+			elapsedFraction: 0.5,
+			hasTimeInfo:     true,
+			wantContains:    []string{"█", "│", "░"},
+		},
+		{
+			name:            "green marker when under budget",
+			percent:         25,
+			elapsedFraction: 0.5,
+			hasTimeInfo:     true,
+			wantContains:    []string{"│", ColorGreen},
+		},
+		{
+			name:            "yellow marker at projected 100%",
+			percent:         50,
+			elapsedFraction: 0.5,
+			hasTimeInfo:     true,
+			wantContains:    []string{"│", ColorYellow},
+		},
+		{
+			name:            "red marker when over projected budget",
+			percent:         80,
+			elapsedFraction: 0.5,
+			hasTimeInfo:     true,
+			wantContains:    []string{"│", ColorRed},
+		},
+		{
+			name:            "low elapsed skips pace projection",
+			percent:         50,
+			elapsedFraction: 0.02,
+			hasTimeInfo:     true,
+			wantContains:    []string{"│"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := renderProgressBar(tt.percent, tt.elapsedFraction, tt.hasTimeInfo)
+			for _, s := range tt.wantContains {
+				if !strings.Contains(result, s) {
+					t.Errorf("expected %q in result, got %q", s, result)
+				}
+			}
+			for _, s := range tt.wantNotContains {
+				if strings.Contains(result, s) {
+					t.Errorf("unexpected %q in result, got %q", s, result)
+				}
+			}
+		})
+	}
+}
+
+func TestCalculateBudgetPeriod(t *testing.T) {
+	durations := []struct {
+		name       string
+		duration   string
+		advance    time.Duration
+		wantPeriod time.Duration
+		wantOK     bool
+	}{
+		{"daily", "1d", 24 * time.Hour, 24 * time.Hour, true},
+		{"weekly", "7d", 7 * 24 * time.Hour, 7 * 24 * time.Hour, true},
+		{"custom 48h", "48h", 48 * time.Hour, 48 * time.Hour, true},
+		{"nil duration", "", 0, 0, false},
+		{"invalid duration", "invalid", 0, 0, false},
+	}
+
+	for _, tt := range durations {
+		t.Run(tt.name, func(t *testing.T) {
+			var dur *string
+			if tt.duration != "" {
+				dur = strPtr(tt.duration)
+			}
+			info := &KeyInfo{BudgetDuration: dur}
+			if tt.wantOK {
+				resetAt := time.Now().UTC().Add(tt.advance).Format(time.RFC3339)
+				info.BudgetResetAt = strPtr(resetAt)
+			}
+			start, end, ok := calculateBudgetPeriod(info)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && end.Sub(start) != tt.wantPeriod {
+				t.Errorf("period = %v, want %v", end.Sub(start), tt.wantPeriod)
+			}
+		})
+	}
+}
+
+func TestCalculateElapsedFraction(t *testing.T) {
+	t.Run("no duration returns false", func(t *testing.T) {
+		info := &KeyInfo{}
+		_, ok := calculateElapsedFraction(info)
+		if ok {
+			t.Error("expected ok=false with no duration")
+		}
+	})
+
+	t.Run("daily budget returns fraction between 0 and 1", func(t *testing.T) {
+		tomorrow := time.Now().UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+		resetAt := tomorrow.Format(time.RFC3339)
+		info := &KeyInfo{
+			BudgetDuration: strPtr("1d"),
+			BudgetResetAt:  strPtr(resetAt),
+		}
+		frac, ok := calculateElapsedFraction(info)
+		if !ok {
+			t.Fatal("expected ok=true")
+		}
+		if frac < 0 || frac > 1.0 {
+			t.Errorf("elapsed fraction = %f, want [0, 1]", frac)
+		}
+		if frac == 0 {
+			t.Error("expected non-zero elapsed fraction mid-day")
+		}
+	})
+
+	t.Run("past reset returns clamped 1.0", func(t *testing.T) {
+		yesterday := time.Now().UTC().Add(-24 * time.Hour)
+		resetAt := yesterday.Format(time.RFC3339)
+		info := &KeyInfo{
+			BudgetDuration: strPtr("1d"),
+			BudgetResetAt:  strPtr(resetAt),
+		}
+		frac, ok := calculateElapsedFraction(info)
+		if !ok {
+			t.Fatal("expected ok=true")
+		}
+		if frac != 1.0 {
+			t.Errorf("elapsed fraction = %f, want 1.0 (clamped)", frac)
+		}
+	})
+}

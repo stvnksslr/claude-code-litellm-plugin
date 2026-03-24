@@ -95,12 +95,27 @@ Add the statusline configuration to your Claude Code settings file:
 The plugin displays budget information in the following format:
 
 ```
-LiteLLM: $4.69/$40.00 (12%) | reset: 3d1h
+LiteLLM: $4.69/$40.00 (12%) | weekly reset: 3d1h
 ```
 
 - Green: 0-74% usage
 - Yellow: 75-89% usage
 - Red: 90%+ usage
+
+### Beta: Progress Bar with Pace Indicator
+
+Enable the progress bar by setting:
+
+```bash
+export LITELLM_PLUGIN_BETA_FEATURES=1
+```
+
+This appends a progress bar to the standard status line shown above. The bar has two components:
+
+- **Fill** (`█`) shows how much of the budget has been spent. Color follows the same green/yellow/red thresholds as the text.
+- **Pace marker** (`│`) shows how far through the budget period you are. It lets you see at a glance whether you're spending ahead of or behind pace.
+
+![Progress bar examples](examples.svg)
 
 ## Environment Variable Priority
 
