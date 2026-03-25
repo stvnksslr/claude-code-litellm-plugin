@@ -5,26 +5,22 @@ go = "1.26.1"
 description = "Build for the current platform"
 run = "go build -o claude-code-litellm-plugin ."
 
+[tasks.fmt]
+description = "Format Go source files"
+run = "go fmt ./..."
+
+[tasks.tidy]
+description = "Tidy go.mod and go.sum"
+run = "go mod tidy"
+
 [tasks.test]
-description = "Run tests"
-run = "go test -v ./..."
+description = "Run tests (count=1 disables cache so examples.svg is always regenerated)"
+run = "go test -v -count=1 ./..."
 
 [tasks.lint]
-description = "Run all linters (fmt, mod tidy, golangci-lint)"
-run = """
-if [ -n "$(gofmt -l .)" ]; then
-  echo "Code is not formatted. Run 'go fmt ./...'"
-  gofmt -d .
-  exit 1
-fi
-go mod tidy
-if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
-  echo "go.mod or go.sum is not tidy. Run 'go mod tidy'"
-  git diff go.mod go.sum
-  exit 1
-fi
-golangci-lint run
-"""
+description = "Run all linters (fmt, tidy, golangci-lint)"
+depends = ["fmt", "tidy"]
+run = "golangci-lint run"
 
 [tasks."build:multi"]
 description = "Build for all CI/CD release targets (linux/darwin/windows x amd64/arm64/386)"
