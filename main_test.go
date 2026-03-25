@@ -839,6 +839,70 @@ func TestFormatStatusLineNoUpdate(t *testing.T) {
 	}
 }
 
+func TestGetPrefix(t *testing.T) {
+	t.Run("default when unset", func(t *testing.T) {
+		if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
+			t.Fatal(err)
+		}
+		if got := getPrefix(); got != "LiteLLM: " {
+			t.Errorf("expected 'LiteLLM: ', got %q", got)
+		}
+	})
+	t.Run("blank when set to empty string", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+		if got := getPrefix(); got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+	t.Run("custom prefix with trailing space", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_PREFIX", "Budget")
+		if got := getPrefix(); got != "Budget " {
+			t.Errorf("expected 'Budget ', got %q", got)
+		}
+	})
+}
+
+func TestFormatStatusLineShowCost(t *testing.T) {
+	spend := 26.71
+	budget := 65.0
+	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+
+	t.Run("cost shown by default", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+		result := formatStatusLine(info, "")
+		if !strings.Contains(result, "$26.71") {
+			t.Errorf("expected dollar amounts in output, got %q", result)
+		}
+	})
+
+	t.Run("cost shown when set to 1", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+		result := formatStatusLine(info, "")
+		if !strings.Contains(result, "$26.71") {
+			t.Errorf("expected dollar amounts in output, got %q", result)
+		}
+	})
+
+	t.Run("cost hidden when set to 0", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "0")
+		result := formatStatusLine(info, "")
+		if strings.Contains(result, "$") {
+			t.Errorf("expected no dollar amounts in output, got %q", result)
+		}
+		if !strings.Contains(result, "41%") {
+			t.Errorf("expected percentage in output, got %q", result)
+		}
+	})
+
+	t.Run("cost hidden when set to false", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "false")
+		result := formatStatusLine(info, "")
+		if strings.Contains(result, "$") {
+			t.Errorf("expected no dollar amounts in output, got %q", result)
+		}
+	})
+}
+
 func TestGetLatestVersionCaching(t *testing.T) {
 	// Use a temp dir so the filesystem cache is fresh for this test
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())

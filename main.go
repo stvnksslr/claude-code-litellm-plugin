@@ -282,10 +282,27 @@ func isDebug() bool {
 	return val == "1" || val == "true"
 }
 
-// isProgressBarEnabled returns true if beta features are enabled via LITELLM_PLUGIN_BETA_FEATURES environment variable
+// isProgressBarEnabled returns true unless LITELLM_PLUGIN_PROGRESS_BAR is explicitly set to "0" or "false"
 func isProgressBarEnabled() bool {
 	val := os.Getenv("LITELLM_PLUGIN_PROGRESS_BAR")
 	return val == "1" || val == "true" || val == ""
+}
+
+// isShowCostEnabled returns true unless LITELLM_PLUGIN_SHOW_COST is explicitly set to "0" or "false"
+func isShowCostEnabled() bool {
+	val := os.Getenv("LITELLM_PLUGIN_SHOW_COST")
+	return val != "0" && val != "false"
+}
+
+// getPrefix returns the status line prefix, defaulting to "LiteLLM: "
+func getPrefix() string {
+	if val, ok := os.LookupEnv("LITELLM_PLUGIN_PREFIX"); ok {
+		if val == "" {
+			return ""
+		}
+		return val + " "
+	}
+	return "LiteLLM: "
 }
 
 // getKeyInfo fetches budget info from the LiteLLM API, using a 30-second filesystem cache
@@ -638,7 +655,7 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 
 	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
 		// No budget set — just show spend
-		return fmt.Sprintf("%sLiteLLM: $%.2f%s%s", ColorGreen, spend, ColorReset, updateStr)
+		return fmt.Sprintf("%s%s$%.2f%s%s", ColorGreen, getPrefix(), spend, ColorReset, updateStr)
 	}
 
 	budget := *info.MaxBudget
@@ -647,7 +664,12 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 	// Absolute color for text
 	absColor := budgetColor(percent)
 
-	budgetStr := fmt.Sprintf("$%.2f/$%.2f", spend, budget)
+	var budgetStr string
+	if isShowCostEnabled() {
+		budgetStr = fmt.Sprintf("$%.2f/$%.2f (%.0f%%)", spend, budget, percent)
+	} else {
+		budgetStr = fmt.Sprintf("%.0f%%", percent)
+	}
 
 	// Reset info
 	resetStr := ""
@@ -660,7 +682,7 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 		}
 	}
 
-	line := fmt.Sprintf("%sLiteLLM: %s (%.0f%%)%s", absColor, budgetStr, percent, ColorReset)
+	line := fmt.Sprintf("%s%s%s%s", absColor, getPrefix(), budgetStr, ColorReset)
 
 	if isProgressBarEnabled() {
 		elapsedFraction, hasTimeInfo := calculateElapsedFraction(info)
@@ -675,7 +697,7 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 
 // formatError formats an error message with red color
 func formatError(msg string) string {
-	return fmt.Sprintf("%sLiteLLM: %s%s", ColorRed, msg, ColorReset)
+	return fmt.Sprintf("%s%s%s%s", ColorRed, getPrefix(), msg, ColorReset)
 }
 
 func main() {
@@ -701,8 +723,8 @@ func main() {
 			var bErr *BudgetExceededError
 			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
 				percent := (bErr.Spend / bErr.MaxBudget) * 100
-				fmt.Printf("%sLiteLLM: $%.2f/$%.2f (%.0f%%) | Budget exceeded%s\n",
-					ColorRed, bErr.Spend, bErr.MaxBudget, percent, ColorReset)
+				fmt.Printf("%s%s$%.2f/$%.2f (%.0f%%) | Budget exceeded%s\n",
+					ColorRed, getPrefix(), bErr.Spend, bErr.MaxBudget, percent, ColorReset)
 			} else {
 				fmt.Println(formatError("Budget exceeded"))
 			}
