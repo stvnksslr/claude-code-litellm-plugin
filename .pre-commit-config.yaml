@@ -3,28 +3,28 @@ repos:
     hooks:
       - id: go-fmt
         name: go fmt
-        entry: go fmt ./...
+        entry: mise run fmt
         language: system
         types: [go]
         pass_filenames: false
 
       - id: go-mod-tidy
         name: go mod tidy
-        entry: go mod tidy
+        entry: mise run tidy
         language: system
         types: [go]
         pass_filenames: false
 
       - id: golangci-lint
         name: golangci-lint
-        entry: golangci-lint run
+        entry: mise run lint
         language: system
         types: [go]
         pass_filenames: false
 
       - id: go-test
         name: go test
-        entry: go test -count=1 ./...
+        entry: mise run test
         language: system
         types: [go]
         pass_filenames: false
