@@ -973,6 +973,229 @@ func TestBudgetCacheReadWrite(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveBudget(t *testing.T) {
+	keySpend := 10.0
+	keyBudget := 50.0
+	teamSpend := 25.0
+	teamBudget := 100.0
+	zeroBudget := 0.0
+	resetAt := "2025-01-15T10:00:00Z"
+	duration := "30d"
+
+	tests := []struct {
+		name          string
+		info          *KeyInfo
+		wantSpend     float64
+		wantMaxBudget float64
+		wantNilBudget bool
+	}{
+		{
+			name: "key budget present — key budget used",
+			info: &KeyInfo{
+				Spend:         &keySpend,
+				MaxBudget:     &keyBudget,
+				TeamSpend:     &teamSpend,
+				TeamMaxBudget: &teamBudget,
+			},
+			wantSpend:     keySpend,
+			wantMaxBudget: keyBudget,
+		},
+		{
+			name: "no key budget — team budget used",
+			info: &KeyInfo{
+				Spend:              &keySpend,
+				TeamSpend:          &teamSpend,
+				TeamMaxBudget:      &teamBudget,
+				TeamBudgetResetAt:  &resetAt,
+				TeamBudgetDuration: &duration,
+			},
+			wantSpend:     teamSpend,
+			wantMaxBudget: teamBudget,
+		},
+		{
+			name: "key budget zero — team budget used",
+			info: &KeyInfo{
+				Spend:         &keySpend,
+				MaxBudget:     &zeroBudget,
+				TeamSpend:     &teamSpend,
+				TeamMaxBudget: &teamBudget,
+			},
+			wantSpend:     teamSpend,
+			wantMaxBudget: teamBudget,
+		},
+		{
+			name:          "no budgets — passthrough",
+			info:          &KeyInfo{Spend: &keySpend},
+			wantSpend:     keySpend,
+			wantNilBudget: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveEffectiveBudget(tt.info)
+			if tt.wantNilBudget {
+				if got.MaxBudget != nil && *got.MaxBudget > 0 {
+					t.Errorf("expected nil/zero MaxBudget, got %v", *got.MaxBudget)
+				}
+				return
+			}
+			if got.Spend == nil || *got.Spend != tt.wantSpend {
+				t.Errorf("Spend = %v, want %v", got.Spend, tt.wantSpend)
+			}
+			if got.MaxBudget == nil || *got.MaxBudget != tt.wantMaxBudget {
+				t.Errorf("MaxBudget = %v, want %v", got.MaxBudget, tt.wantMaxBudget)
+			}
+		})
+	}
+}
+
+func TestFormatStatusLineTeamBudget(t *testing.T) {
+	keySpend := 10.0
+	teamSpend := 40.0
+	teamBudget := 100.0
+	duration := "30d"
+
+	t.Run("team budget shown when key has no budget", func(t *testing.T) {
+		info := &KeyInfo{
+			Spend:              &keySpend,
+			TeamSpend:          &teamSpend,
+			TeamMaxBudget:      &teamBudget,
+			TeamBudgetDuration: &duration,
+		}
+		result := formatStatusLine(info, "")
+		if !strings.Contains(result, "$40.00/$100.00") {
+			t.Errorf("expected team spend/budget in output, got %q", result)
+		}
+		if !strings.Contains(result, "(40%)") {
+			t.Errorf("expected team usage percentage, got %q", result)
+		}
+	})
+
+	t.Run("key budget takes priority over team budget", func(t *testing.T) {
+		keyBudget := 50.0
+		info := &KeyInfo{
+			Spend:         &keySpend,
+			MaxBudget:     &keyBudget,
+			TeamSpend:     &teamSpend,
+			TeamMaxBudget: &teamBudget,
+		}
+		result := formatStatusLine(info, "")
+		if !strings.Contains(result, "$10.00/$50.00") {
+			t.Errorf("expected key spend/budget in output, got %q", result)
+		}
+	})
+}
+
+func TestFetchTeamInfo(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	memberBudget := 65.0
+	memberDuration := "7d"
+	resetAt := "2026-04-06T00:00:00Z"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/team/info" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Query().Get("team_id") != "team-123" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		response := TeamInfoAPIResponse{
+			TeamInfo: TeamInfoData{
+				BudgetDuration: &memberDuration,
+				BudgetResetAt:  &resetAt,
+				TeamMemberBudgetTable: &TeamMemberBudgetTable{
+					MaxBudget:      &memberBudget,
+					BudgetDuration: &memberDuration,
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	data, err := fetchTeamInfo("test-token", "team-123")
+	if err != nil {
+		t.Fatalf("fetchTeamInfo() error = %v", err)
+	}
+	if data.TeamMemberBudgetTable == nil {
+		t.Fatal("expected non-nil TeamMemberBudgetTable")
+	}
+	if data.TeamMemberBudgetTable.MaxBudget == nil || *data.TeamMemberBudgetTable.MaxBudget != 65.0 {
+		t.Errorf("expected MaxBudget=65.0, got %v", data.TeamMemberBudgetTable.MaxBudget)
+	}
+	if data.BudgetResetAt == nil || *data.BudgetResetAt != resetAt {
+		t.Errorf("expected BudgetResetAt=%q, got %v", resetAt, data.BudgetResetAt)
+	}
+}
+
+func TestGetKeyInfoMergesTeamBudget(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	keySpend := 4.0
+	memberBudget := 65.0
+	memberDuration := "7d"
+	resetAt := "2026-04-06T00:00:00Z"
+	teamID := "team-123"
+	keyDuration := "7d"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/key/info":
+			resp := KeyInfoResponse{
+				Info: KeyInfo{
+					Spend:          &keySpend,
+					TeamID:         &teamID,
+					BudgetDuration: &keyDuration,
+					BudgetResetAt:  &resetAt,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/team/info":
+			resp := TeamInfoAPIResponse{
+				TeamInfo: TeamInfoData{
+					BudgetDuration: &memberDuration,
+					BudgetResetAt:  &resetAt,
+					TeamMemberBudgetTable: &TeamMemberBudgetTable{
+						MaxBudget:      &memberBudget,
+						BudgetDuration: &memberDuration,
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	info, err := getKeyInfo("test-token")
+	if err != nil {
+		t.Fatalf("getKeyInfo() error = %v", err)
+	}
+	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 65.0 {
+		t.Errorf("expected TeamMaxBudget=65.0, got %v", info.TeamMaxBudget)
+	}
+	if info.TeamSpend == nil || *info.TeamSpend != 4.0 {
+		t.Errorf("expected TeamSpend=4.0 (key spend), got %v", info.TeamSpend)
+	}
+
+	// formatStatusLine should show member budget, not raw spend
+	result := formatStatusLine(info, "")
+	if !strings.Contains(result, "$4.00/$65.00") {
+		t.Errorf("expected $4.00/$65.00 in output, got %q", result)
+	}
+}
+
 func TestZeroBudgetDivision(t *testing.T) {
 	spend := 10.0
 	zeroBudget := 0.0

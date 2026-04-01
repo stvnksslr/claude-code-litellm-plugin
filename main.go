@@ -85,6 +85,50 @@ type KeyInfo struct {
 	MaxBudget      *float64 `json:"max_budget"`
 	BudgetResetAt  *string  `json:"budget_reset_at"`
 	BudgetDuration *string  `json:"budget_duration"`
+	TeamID         *string  `json:"team_id"`
+	// Team-level budget fields (populated from /team/info when key has no max_budget)
+	TeamSpend          *float64 `json:"team_spend"`
+	TeamMaxBudget      *float64 `json:"team_max_budget"`
+	TeamBudgetResetAt  *string  `json:"team_budget_reset_at"`
+	TeamBudgetDuration *string  `json:"team_budget_duration"`
+}
+
+// TeamMemberBudgetTable holds the per-user budget within a team.
+type TeamMemberBudgetTable struct {
+	MaxBudget      *float64 `json:"max_budget"`
+	BudgetDuration *string  `json:"budget_duration"`
+}
+
+// TeamInfoData is the nested team_info object in the /team/info response.
+type TeamInfoData struct {
+	Spend                 *float64               `json:"spend"`
+	MaxBudget             *float64               `json:"max_budget"`
+	BudgetDuration        *string                `json:"budget_duration"`
+	BudgetResetAt         *string                `json:"budget_reset_at"`
+	TeamMemberBudgetTable *TeamMemberBudgetTable `json:"team_member_budget_table"`
+}
+
+// TeamInfoAPIResponse is the top-level /team/info response.
+type TeamInfoAPIResponse struct {
+	TeamInfo TeamInfoData `json:"team_info"`
+}
+
+// resolveEffectiveBudget returns a *KeyInfo populated with the most relevant budget
+// information. Key-level budget takes priority; team-level budget is used as fallback
+// when the key has no budget of its own.
+func resolveEffectiveBudget(info *KeyInfo) *KeyInfo {
+	if info.MaxBudget != nil && *info.MaxBudget > 0 {
+		return info
+	}
+	if info.TeamMaxBudget != nil && *info.TeamMaxBudget > 0 {
+		return &KeyInfo{
+			Spend:          info.TeamSpend,
+			MaxBudget:      info.TeamMaxBudget,
+			BudgetResetAt:  info.TeamBudgetResetAt,
+			BudgetDuration: info.TeamBudgetDuration,
+		}
+	}
+	return info
 }
 
 // GitHubRelease represents the GitHub releases API response
@@ -308,6 +352,8 @@ func getPrefix() string {
 // getKeyInfo fetches budget info from the LiteLLM API, using a 30-second filesystem cache
 // to avoid hitting the API on every statusline refresh.
 // Each invocation of this binary is a fresh process, so all state must live on disk.
+// When the key has a team_id and no key-level max_budget, a second call to /team/info
+// is made to populate team membership budget fields.
 func getKeyInfo(apiKey string) (*KeyInfo, error) {
 	if info, ok := readBudgetCache(); ok {
 		return info, nil
@@ -315,6 +361,19 @@ func getKeyInfo(apiKey string) (*KeyInfo, error) {
 	info, err := fetchKeyInfo(apiKey)
 	if err != nil {
 		return nil, err
+	}
+	if info.TeamID != nil && *info.TeamID != "" && (info.MaxBudget == nil || *info.MaxBudget <= 0) {
+		if teamData, err := fetchTeamInfo(apiKey, *info.TeamID); err == nil {
+			info.TeamSpend = info.Spend
+			info.TeamBudgetResetAt = teamData.BudgetResetAt
+			if teamData.TeamMemberBudgetTable != nil {
+				info.TeamMaxBudget = teamData.TeamMemberBudgetTable.MaxBudget
+				info.TeamBudgetDuration = teamData.TeamMemberBudgetTable.BudgetDuration
+			}
+			if info.TeamBudgetDuration == nil {
+				info.TeamBudgetDuration = teamData.BudgetDuration
+			}
+		}
 	}
 	writeBudgetCache(info)
 	return info, nil
@@ -368,6 +427,45 @@ func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 	}
 
 	return &response.Info, nil
+}
+
+// fetchTeamInfo calls /team/info to get team-level budget data.
+// Returns nil, error on failure — callers treat this as best-effort.
+func fetchTeamInfo(apiKey, teamID string) (*TeamInfoData, error) {
+	baseURL := getBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("no LiteLLM proxy URL configured")
+	}
+	url := baseURL + "/team/info?team_id=" + teamID
+
+	client := &http.Client{Timeout: HTTPTimeout}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("team info HTTP error: status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var response TeamInfoAPIResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+	return &response.TeamInfo, nil
 }
 
 // parseISOTime parses an ISO 8601 datetime string with timezone support
@@ -643,6 +741,7 @@ func renderProgressBar(percent float64, elapsedFraction float64, hasTimeInfo boo
 // formatStatusLine formats the budget info as a colored progress bar.
 // latestVersion is the latest GitHub release tag (empty string to skip update notice).
 func formatStatusLine(info *KeyInfo, latestVersion string) string {
+	info = resolveEffectiveBudget(info)
 	spend := 0.0
 	if info.Spend != nil {
 		spend = *info.Spend

@@ -142,6 +142,16 @@ func TestGenerateExamples(t *testing.T) {
 			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
 			env:   map[string]string{"LITELLM_PLUGIN_PREFIX": ""},
 		},
+		{
+			label: "Team budget (no key budget)",
+			info: &KeyInfo{
+				Spend:              &spend20,
+				TeamSpend:          &spend20,
+				TeamMaxBudget:      &budget,
+				TeamBudgetResetAt:  &resetAt,
+				TeamBudgetDuration: &weekly,
+			},
+		},
 	}
 
 	statusHeight := len(examples) * statusRowHeight
