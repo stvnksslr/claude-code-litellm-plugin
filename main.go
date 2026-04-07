@@ -86,6 +86,7 @@ type KeyInfo struct {
 	BudgetResetAt  *string  `json:"budget_reset_at"`
 	BudgetDuration *string  `json:"budget_duration"`
 	TeamID         *string  `json:"team_id"`
+	UserID         *string  `json:"user_id"`
 	// Team-level budget fields (populated from /team/info when key has no max_budget)
 	TeamSpend          *float64 `json:"team_spend"`
 	TeamMaxBudget      *float64 `json:"team_max_budget"`
@@ -108,9 +109,17 @@ type TeamInfoData struct {
 	TeamMemberBudgetTable *TeamMemberBudgetTable `json:"team_member_budget_table"`
 }
 
+// TeamMembership represents a single entry in the team_memberships array.
+type TeamMembership struct {
+	UserID string   `json:"user_id"`
+	TeamID string   `json:"team_id"`
+	Spend  *float64 `json:"spend"`
+}
+
 // TeamInfoAPIResponse is the top-level /team/info response.
 type TeamInfoAPIResponse struct {
-	TeamInfo TeamInfoData `json:"team_info"`
+	TeamInfo        TeamInfoData     `json:"team_info"`
+	TeamMemberships []TeamMembership `json:"team_memberships"`
 }
 
 // resolveEffectiveBudget returns a *KeyInfo populated with the most relevant budget
@@ -363,15 +372,33 @@ func getKeyInfo(apiKey string) (*KeyInfo, error) {
 		return nil, err
 	}
 	if info.TeamID != nil && *info.TeamID != "" && (info.MaxBudget == nil || *info.MaxBudget <= 0) {
-		if teamData, err := fetchTeamInfo(apiKey, *info.TeamID); err == nil {
-			info.TeamSpend = info.Spend
-			info.TeamBudgetResetAt = teamData.BudgetResetAt
-			if teamData.TeamMemberBudgetTable != nil {
-				info.TeamMaxBudget = teamData.TeamMemberBudgetTable.MaxBudget
-				info.TeamBudgetDuration = teamData.TeamMemberBudgetTable.BudgetDuration
+		if teamResp, err := fetchTeamInfo(apiKey, *info.TeamID); err == nil {
+			// Use the team member's own spend from team_memberships if available,
+			// falling back to the team's total spend. The key's spend field has no
+			// budget_duration and never resets, so it would look like the budget
+			// never resets even though team/membership spend does.
+			memberSpendFound := false
+			if info.UserID != nil && *info.UserID != "" {
+				for _, m := range teamResp.TeamMemberships {
+					if m.UserID == *info.UserID && m.Spend != nil {
+						info.TeamSpend = m.Spend
+						memberSpendFound = true
+						break
+					}
+				}
+			}
+			if !memberSpendFound {
+				// No per-user membership row: use key-level spend, which tracks only
+				// this key's individual usage and resets on its own budget_reset_at.
+				info.TeamSpend = info.Spend
+			}
+			info.TeamBudgetResetAt = teamResp.TeamInfo.BudgetResetAt
+			if teamResp.TeamInfo.TeamMemberBudgetTable != nil {
+				info.TeamMaxBudget = teamResp.TeamInfo.TeamMemberBudgetTable.MaxBudget
+				info.TeamBudgetDuration = teamResp.TeamInfo.TeamMemberBudgetTable.BudgetDuration
 			}
 			if info.TeamBudgetDuration == nil {
-				info.TeamBudgetDuration = teamData.BudgetDuration
+				info.TeamBudgetDuration = teamResp.TeamInfo.BudgetDuration
 			}
 		}
 	}
@@ -431,7 +458,7 @@ func fetchKeyInfo(apiKey string) (*KeyInfo, error) {
 
 // fetchTeamInfo calls /team/info to get team-level budget data.
 // Returns nil, error on failure — callers treat this as best-effort.
-func fetchTeamInfo(apiKey, teamID string) (*TeamInfoData, error) {
+func fetchTeamInfo(apiKey, teamID string) (*TeamInfoAPIResponse, error) {
 	baseURL := getBaseURL()
 	if baseURL == "" {
 		return nil, fmt.Errorf("no LiteLLM proxy URL configured")
@@ -465,7 +492,7 @@ func fetchTeamInfo(apiKey, teamID string) (*TeamInfoData, error) {
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, err
 	}
-	return &response.TeamInfo, nil
+	return &response, nil
 }
 
 // parseISOTime parses an ISO 8601 datetime string with timezone support

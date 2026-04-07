@@ -1124,14 +1124,14 @@ func TestFetchTeamInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchTeamInfo() error = %v", err)
 	}
-	if data.TeamMemberBudgetTable == nil {
+	if data.TeamInfo.TeamMemberBudgetTable == nil {
 		t.Fatal("expected non-nil TeamMemberBudgetTable")
 	}
-	if data.TeamMemberBudgetTable.MaxBudget == nil || *data.TeamMemberBudgetTable.MaxBudget != 65.0 {
-		t.Errorf("expected MaxBudget=65.0, got %v", data.TeamMemberBudgetTable.MaxBudget)
+	if data.TeamInfo.TeamMemberBudgetTable.MaxBudget == nil || *data.TeamInfo.TeamMemberBudgetTable.MaxBudget != 65.0 {
+		t.Errorf("expected MaxBudget=65.0, got %v", data.TeamInfo.TeamMemberBudgetTable.MaxBudget)
 	}
-	if data.BudgetResetAt == nil || *data.BudgetResetAt != resetAt {
-		t.Errorf("expected BudgetResetAt=%q, got %v", resetAt, data.BudgetResetAt)
+	if data.TeamInfo.BudgetResetAt == nil || *data.TeamInfo.BudgetResetAt != resetAt {
+		t.Errorf("expected BudgetResetAt=%q, got %v", resetAt, data.TeamInfo.BudgetResetAt)
 	}
 }
 
@@ -1193,6 +1193,69 @@ func TestGetKeyInfoMergesTeamBudget(t *testing.T) {
 	result := formatStatusLine(info, "")
 	if !strings.Contains(result, "$4.00/$65.00") {
 		t.Errorf("expected $4.00/$65.00 in output, got %q", result)
+	}
+}
+
+func TestGetKeyInfoFallsBackToKeySpendWhenNoMembership(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	keySpend := 1.33
+	memberBudget := 65.0
+	memberDuration := "7d"
+	resetAt := "2026-04-13T00:00:00Z"
+	teamID := "team-pfe-sat"
+	userID := "steven.kessler@pitchbook.com"
+	otherUserID := "other.user@pitchbook.com"
+	otherSpend := 12.80
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/key/info":
+			resp := KeyInfoResponse{
+				Info: KeyInfo{
+					Spend:  &keySpend,
+					TeamID: &teamID,
+					UserID: &userID,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/team/info":
+			// Memberships exist but do NOT include the calling user
+			resp := TeamInfoAPIResponse{
+				TeamInfo: TeamInfoData{
+					Spend:          &otherSpend, // team total
+					BudgetDuration: &memberDuration,
+					BudgetResetAt:  &resetAt,
+					TeamMemberBudgetTable: &TeamMemberBudgetTable{
+						MaxBudget:      &memberBudget,
+						BudgetDuration: &memberDuration,
+					},
+				},
+				TeamMemberships: []TeamMembership{
+					{UserID: otherUserID, TeamID: teamID, Spend: &otherSpend},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	info, err := getKeyInfo("test-token")
+	if err != nil {
+		t.Fatalf("getKeyInfo() error = %v", err)
+	}
+	if info.TeamSpend == nil || *info.TeamSpend != keySpend {
+		t.Errorf("expected TeamSpend=%v (key spend fallback), got %v", keySpend, info.TeamSpend)
+	}
+
+	result := formatStatusLine(info, "")
+	if !strings.Contains(result, "$1.33/$65.00") {
+		t.Errorf("expected $1.33/$65.00 in output, got %q", result)
 	}
 }
 
