@@ -86,19 +86,41 @@ func withEnv(env map[string]string, f func()) {
 	}
 }
 
+// ctxInput builds a StatusInput with the given model name and context percentage.
+// Pass nil pct to leave the context window absent.
+func ctxInput(model string, pct *float64) StatusInput {
+	var in StatusInput
+	in.Model.DisplayName = model
+	if pct != nil {
+		in.ContextWindow = &struct {
+			UsedPercentage *float64 `json:"used_percentage"`
+		}{UsedPercentage: pct}
+	}
+	return in
+}
+
+func f64(v float64) *float64 { return &v }
+
 func TestGenerateExamples(t *testing.T) {
 	origVersion := Version
 	defer func() { Version = origVersion }()
 	Version = "v99.0.0"
+
+	// Ensure no ambient env vars bleed into the rendered examples.
+	if err := os.Unsetenv("LITELLM_PLUGIN_SHOW_COST"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
+		t.Fatal(err)
+	}
 
 	weekly := "7d"
 	budget := 50.0
 
 	// Layout constants
 	padX, padY := 16, 16
-	width := 762
+	width := 920
 
-	// --- Section 1: Full status line examples (simple → detailed) ---
 	statusLabelHeight := 18
 	statusLineHeight := 18
 	statusRowHeight := statusLabelHeight + statusLineHeight + 8
@@ -106,41 +128,76 @@ func TestGenerateExamples(t *testing.T) {
 	type statusExample struct {
 		label string
 		info  *KeyInfo
+		input StatusInput
 		// env holds LITELLM_PLUGIN_* overrides for this example.
 		// Keys are auto-appended to the label via pluginEnvLabel.
 		env map[string]string
 	}
 
-	spend20 := 20.0
-	spend30 := 30.0
+	// Spends chosen so circle glyphs span all five buckets (○ ◔ ◑ ◕ ●).
+	spend0 := 0.0   // 0%   → ○
+	spend10 := 10.0 // 20%  → ◔
+	spend20 := 20.0 // 40%  → ◑
+	spend35 := 35.0 // 70%  → ◕
+	spend48 := 48.0 // 96%  → ●
 	resetAt := weeklyResetAt(0.5)
 	examples := []statusExample{
 		{
-			label: "No budget configured",
-			info:  &KeyInfo{Spend: &spend30},
+			label: "Empty budget (0%) — ○",
+			info:  &KeyInfo{Spend: &spend0, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", nil),
 		},
 		{
-			label: "No reset date available",
-			info:  &KeyInfo{Spend: &spend30, MaxBudget: &budget},
+			label: "Quarter budget (20%) — ◔",
+			info:  &KeyInfo{Spend: &spend10, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", nil),
 		},
 		{
-			label: "Reset date available",
+			label: "Half budget (40%) — ◑",
 			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", nil),
 		},
 		{
-			label: "Cost hidden",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
-			env:   map[string]string{"LITELLM_PLUGIN_SHOW_COST": "0"},
+			label: "Three-quarter budget (70%) — ◕",
+			info:  &KeyInfo{Spend: &spend35, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", nil),
 		},
 		{
-			label: "Custom prefix",
+			label: "Full budget (96%) — ●",
+			info:  &KeyInfo{Spend: &spend48, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", nil),
+		},
+		{
+			label: "Context segment — low (no suggestion)",
 			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", f64(30)),
+		},
+		{
+			label: "Context segment — warn (consider /compact)",
+			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", f64(78)),
+		},
+		{
+			label: "Context segment — critical (run /compact or /clear)",
+			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", f64(92)),
+		},
+		{
+			label: "Dollar amounts restored",
+			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", f64(45)),
+			env:   map[string]string{"LITELLM_PLUGIN_SHOW_COST": "1"},
+		},
+		{
+			label: "Custom prefix wins over model name",
+			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			input: ctxInput("Opus 4.7", f64(45)),
 			env:   map[string]string{"LITELLM_PLUGIN_PREFIX": "💰"},
 		},
 		{
-			label: "No prefix",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
-			env:   map[string]string{"LITELLM_PLUGIN_PREFIX": ""},
+			label: "No budget configured",
+			info:  &KeyInfo{Spend: &spend20},
+			input: ctxInput("Opus 4.7", f64(45)),
 		},
 		{
 			label: "Team budget (no key budget)",
@@ -151,26 +208,21 @@ func TestGenerateExamples(t *testing.T) {
 				TeamBudgetResetAt:  &resetAt,
 				TeamBudgetDuration: &weekly,
 			},
+			input: ctxInput("Sonnet 4.6", f64(45)),
+		},
+		{
+			label: "Falls back to LiteLLM: when no stdin",
+			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
 		},
 	}
 
 	statusHeight := len(examples) * statusRowHeight
-
-	// --- Section 2: 3x3 color reference grid ---
-	sectionGap := 20
-	rowLabelWidth := 130
-	colWidth := 200
-	headerHeight := 28
-	rowHeight := 36
-	gridHeight := headerHeight + 3*rowHeight
-
-	height := padY + statusHeight + sectionGap + gridHeight + padY
+	height := padY + statusHeight + padY
 
 	var svg strings.Builder
 	fmt.Fprintf(&svg, `<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" font-family="monospace" font-size="14">`, width, height)
 	fmt.Fprintf(&svg, `<rect width="%d" height="%d" rx="8" fill="#1e1e2e"/>`, width, height)
 
-	// --- Render status line examples ---
 	for i, ex := range examples {
 		baseY := padY + i*statusRowHeight
 
@@ -185,84 +237,10 @@ func TestGenerateExamples(t *testing.T) {
 
 		var line string
 		withEnv(ex.env, func() {
-			line = formatStatusLine(ex.info, "")
+			line = formatStatusLine(ex.info, "", ex.input)
 		})
 		fmt.Fprintf(&svg, `<text x="%d" y="%d">%s</text>`,
 			padX, baseY+statusLabelHeight+statusLineHeight, ansiToSpans(line))
-	}
-
-	// --- Render 3x3 grid ---
-	type cell struct {
-		percent         float64
-		elapsedFraction float64
-		possible        bool
-	}
-
-	grid := [3][3]cell{
-		// Green fill (40% spent)
-		{
-			{40, 0.70, true}, // projected 57%  → green marker
-			{40, 0.50, true}, // projected 80%  → yellow marker
-			{40, 0.25, true}, // projected 160% → red marker
-		},
-		// Yellow fill (82% spent)
-		{
-			{0, 0, false},    // impossible: can't project < 75% with 82% spent
-			{82, 0.95, true}, // projected 86%  → yellow marker
-			{82, 0.55, true}, // projected 149% → red marker
-		},
-		// Red fill (95% spent)
-		{
-			{0, 0, false},    // impossible: can't project < 75% with 95% spent
-			{95, 0.98, true}, // projected 97%  → yellow marker
-			{95, 0.70, true}, // projected 136% → red marker
-		},
-	}
-
-	rowLabels := []string{"&lt; 75% spent", "75-90% spent", "&gt; 90% spent"}
-	colLabels := []string{"Under pace", "At pace", "Over pace"}
-
-	gridY := padY + statusHeight + sectionGap
-
-	fmt.Fprintf(&svg, `<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#374151" stroke-width="1"/>`,
-		padX, gridY, width-padX, gridY)
-
-	for j, label := range colLabels {
-		x := padX + rowLabelWidth + j*colWidth + colWidth/2
-		fmt.Fprintf(&svg, `<text x="%d" y="%d" fill="#9ca3af" text-anchor="middle" font-size="12">%s</text>`,
-			x, gridY+18, label)
-	}
-	fmt.Fprintf(&svg, `<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#374151" stroke-width="1"/>`,
-		padX, gridY+headerHeight, width-padX, gridY+headerHeight)
-
-	for i := 0; i < 3; i++ {
-		baseY := gridY + headerHeight + i*rowHeight
-		textY := baseY + rowHeight/2 + 5
-
-		if i > 0 {
-			fmt.Fprintf(&svg, `<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#374151" stroke-width="1"/>`,
-				padX, baseY, width-padX, baseY)
-		}
-
-		fmt.Fprintf(&svg, `<text x="%d" y="%d" fill="#9ca3af" font-size="12">%s</text>`,
-			padX, textY, rowLabels[i])
-
-		for j := 0; j < 3; j++ {
-			c := grid[i][j]
-			cellX := padX + rowLabelWidth + j*colWidth
-
-			fmt.Fprintf(&svg, `<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#374151" stroke-width="1"/>`,
-				cellX, gridY+headerHeight, cellX, gridY+gridHeight)
-
-			if !c.possible {
-				fmt.Fprintf(&svg, `<text x="%d" y="%d" fill="#4b5563" text-anchor="middle">—</text>`,
-					cellX+colWidth/2, textY)
-			} else {
-				bar := renderProgressBar(c.percent, c.elapsedFraction, true)
-				fmt.Fprintf(&svg, `<text x="%d" y="%d">%s</text>`,
-					cellX+8, textY, ansiToSpans(bar))
-			}
-		}
 	}
 
 	svg.WriteString(`</svg>`)

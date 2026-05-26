@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -143,6 +142,27 @@ func resolveEffectiveBudget(info *KeyInfo) *KeyInfo {
 // GitHubRelease represents the GitHub releases API response
 type GitHubRelease struct {
 	TagName string `json:"tag_name"`
+}
+
+// StatusInput captures the subset of Claude Code's stdin JSON we care about.
+// All fields are optional — missing/null fields are treated as absent.
+type StatusInput struct {
+	Model struct {
+		DisplayName string `json:"display_name"`
+		ID          string `json:"id"`
+	} `json:"model"`
+	ContextWindow *struct {
+		UsedPercentage *float64 `json:"used_percentage"`
+	} `json:"context_window"`
+}
+
+// readStatusInput decodes the JSON payload Claude Code sends on stdin.
+// Any parse failure (empty stdin, malformed JSON) yields a zero-valued
+// StatusInput — the plugin must keep rendering even when stdin is unusable.
+func readStatusInput(r io.Reader) StatusInput {
+	var input StatusInput
+	_ = json.NewDecoder(r).Decode(&input)
+	return input
 }
 
 // cacheDir returns the directory used for filesystem caching.
@@ -335,25 +355,24 @@ func isDebug() bool {
 	return val == "1" || val == "true"
 }
 
-// isProgressBarEnabled returns true unless LITELLM_PLUGIN_PROGRESS_BAR is explicitly set to "0" or "false"
-func isProgressBarEnabled() bool {
-	val := os.Getenv("LITELLM_PLUGIN_PROGRESS_BAR")
-	return val == "1" || val == "true" || val == ""
-}
-
-// isShowCostEnabled returns true unless LITELLM_PLUGIN_SHOW_COST is explicitly set to "0" or "false"
+// isShowCostEnabled returns true only when LITELLM_PLUGIN_SHOW_COST is explicitly enabled.
+// Default is false — percent-only display, no dollar amounts.
 func isShowCostEnabled() bool {
 	val := os.Getenv("LITELLM_PLUGIN_SHOW_COST")
-	return val != "0" && val != "false"
+	return val == "1" || val == "true"
 }
 
-// getPrefix returns the status line prefix, defaulting to "LiteLLM: "
-func getPrefix() string {
+// getPrefix returns the status line prefix.
+// Precedence: LITELLM_PLUGIN_PREFIX (if set, even to empty) > stdin model display name > "LiteLLM: ".
+func getPrefix(input StatusInput) string {
 	if val, ok := os.LookupEnv("LITELLM_PLUGIN_PREFIX"); ok {
 		if val == "" {
 			return ""
 		}
 		return val + " "
+	}
+	if name := strings.TrimSpace(input.Model.DisplayName); name != "" {
+		return name + ": "
 	}
 	return "LiteLLM: "
 }
@@ -621,6 +640,24 @@ func budgetColor(percent float64) string {
 	return ColorGreen
 }
 
+// circleGlyph returns a Unicode quadrant-fill glyph approximating the given
+// usage percentage as a circular gauge.
+// Buckets: empty (≤0) · quarter (<30) · half (<60) · three-quarter (<85) · full (≥85).
+func circleGlyph(percent float64) string {
+	switch {
+	case percent <= 0:
+		return "○"
+	case percent < 30:
+		return "◔"
+	case percent < 60:
+		return "◑"
+	case percent < 85:
+		return "◕"
+	default:
+		return "●"
+	}
+}
+
 // parseCustomDuration parses a duration string like "48h", "2d" into time.Duration
 func parseCustomDuration(duration string) (time.Duration, bool) {
 	if len(duration) < 2 {
@@ -645,129 +682,48 @@ func parseCustomDuration(duration string) (time.Duration, bool) {
 	return 0, false
 }
 
-// calculateBudgetPeriod returns the start and end of the current budget period.
-// Requires BudgetDuration to determine period length.
-// If BudgetResetAt is set, it overrides the calculated period end.
-func calculateBudgetPeriod(keyInfo *KeyInfo) (time.Time, time.Time, bool) {
-	if keyInfo.BudgetDuration == nil || *keyInfo.BudgetDuration == "" {
-		return time.Time{}, time.Time{}, false
+// contextColor returns the ANSI color code for a context-window usage percentage.
+// Mirrors budgetColor's thresholds but kept as a separate function so the two
+// can drift independently if user feedback warrants it.
+func contextColor(percent float64) string {
+	if percent >= 85 {
+		return ColorRed
 	}
-
-	normalized := normalizeDuration(*keyInfo.BudgetDuration)
-	d, ok := parseCustomDuration(normalized)
-	if !ok {
-		return time.Time{}, time.Time{}, false
+	if percent >= 70 {
+		return ColorYellow
 	}
-
-	// Determine period end
-	var periodEnd time.Time
-	if keyInfo.BudgetResetAt != nil && *keyInfo.BudgetResetAt != "" {
-		if t, err := parseISOTime(*keyInfo.BudgetResetAt); err == nil {
-			periodEnd = t
-		}
-	}
-	if periodEnd.IsZero() {
-		periodEnd = time.Now().UTC().Add(d)
-	}
-
-	periodStart := periodEnd.Add(-d)
-	return periodStart, periodEnd, true
+	return ColorGreen
 }
 
-// calculateElapsedFraction returns what fraction of the current budget period has elapsed (0.0–1.0).
-func calculateElapsedFraction(keyInfo *KeyInfo) (float64, bool) {
-	periodStart, periodEnd, ok := calculateBudgetPeriod(keyInfo)
-	if !ok {
-		return 0, false
+// formatContextSegment renders the " | 📖 ● <pct>%[ — suggestion]" segment from
+// Claude Code's stdin payload. Returns "" when the context window data is absent
+// (no field, null pointer, or pre-first-API-call).
+func formatContextSegment(input StatusInput) string {
+	if input.ContextWindow == nil || input.ContextWindow.UsedPercentage == nil {
+		return ""
 	}
-
-	now := time.Now().UTC()
-	total := periodEnd.Sub(periodStart)
-	elapsed := now.Sub(periodStart)
-
-	if total <= 0 {
-		return 0, false
+	pct := *input.ContextWindow.UsedPercentage
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
 	}
-
-	fraction := elapsed.Seconds() / total.Seconds()
-	// Clamp to [0.0, 1.0] to handle edge cases like clock skew
-	if fraction < 0 {
-		fraction = 0
-	} else if fraction > 1.0 {
-		fraction = 1.0
+	color := contextColor(pct)
+	suggestion := ""
+	switch {
+	case pct >= 85:
+		suggestion = " — run /compact or /clear"
+	case pct >= 70:
+		suggestion = " — consider /compact"
 	}
-	return fraction, true
+	return fmt.Sprintf(" %s|%s 📖 %s%s%s %.0f%%%s%s",
+		ColorGray, ColorReset, color, circleGlyph(pct), ColorReset, pct, suggestion, ColorReset)
 }
 
-// renderProgressBar renders a 20-character progress bar with optional pace marker.
-// Fill color is based on absolute spend thresholds.
-// Marker color is based on projected end-of-period usage.
-func renderProgressBar(percent float64, elapsedFraction float64, hasTimeInfo bool) string {
-	const barWidth = 20
-
-	fillWidth := int(math.Round(percent / 100.0 * float64(barWidth)))
-	if fillWidth > barWidth {
-		fillWidth = barWidth
-	}
-	if fillWidth < 0 {
-		fillWidth = 0
-	}
-
-	markerPos := -1
-	if hasTimeInfo {
-		markerPos = int(math.Round(elapsedFraction * float64(barWidth)))
-		if markerPos >= barWidth {
-			markerPos = barWidth - 1
-		}
-		if markerPos < 0 {
-			markerPos = 0
-		}
-	}
-
-	// Absolute color for fill
-	absColor := budgetColor(percent)
-
-	// Pace color for marker
-	paceColor := absColor
-	if hasTimeInfo && elapsedFraction > 0.03 && elapsedFraction < 1.0 {
-		projected := percent / elapsedFraction
-		if projected > 100 {
-			paceColor = ColorRed
-		} else if projected >= 75 {
-			paceColor = ColorYellow
-		} else {
-			paceColor = ColorGreen
-		}
-	}
-
-	var buf strings.Builder
-	buf.WriteString("[")
-
-	lastColor := ""
-	for i := 0; i < barWidth; i++ {
-		var color, char string
-		if i == markerPos {
-			color, char = paceColor, "│"
-		} else if i < fillWidth {
-			color, char = absColor, "█"
-		} else {
-			color, char = ColorGray, "░"
-		}
-		if color != lastColor {
-			buf.WriteString(color)
-			lastColor = color
-		}
-		buf.WriteString(char)
-	}
-
-	buf.WriteString(ColorReset)
-	buf.WriteString("]")
-	return buf.String()
-}
-
-// formatStatusLine formats the budget info as a colored progress bar.
+// formatStatusLine formats the budget info as a colored status circle with optional
+// dollar amounts, reset countdown, and context-window segment.
 // latestVersion is the latest GitHub release tag (empty string to skip update notice).
-func formatStatusLine(info *KeyInfo, latestVersion string) string {
+func formatStatusLine(info *KeyInfo, latestVersion string, input StatusInput) string {
 	info = resolveEffectiveBudget(info)
 	spend := 0.0
 	if info.Spend != nil {
@@ -779,15 +735,16 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 		updateStr = fmt.Sprintf(" %s| update: %s%s", ColorYellow, latestVersion, ColorReset)
 	}
 
+	contextStr := formatContextSegment(input)
+	prefix := getPrefix(input)
+
 	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
-		// No budget set — just show spend
-		return fmt.Sprintf("%s%s$%.2f%s%s", ColorGreen, getPrefix(), spend, ColorReset, updateStr)
+		// No budget set — show spend in dollars (the only data we have).
+		return fmt.Sprintf("%s%s$%.2f%s%s%s", ColorGreen, prefix, spend, ColorReset, updateStr, contextStr)
 	}
 
 	budget := *info.MaxBudget
 	percent := (spend / budget) * 100
-
-	// Absolute color for text
 	absColor := budgetColor(percent)
 
 	var budgetStr string
@@ -797,7 +754,6 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 		budgetStr = fmt.Sprintf("%.0f%%", percent)
 	}
 
-	// Reset info
 	resetStr := ""
 	resetTime, durationLabel := formatTimeUntilReset(info.BudgetResetAt, info.BudgetDuration)
 	if resetTime != "" {
@@ -808,22 +764,16 @@ func formatStatusLine(info *KeyInfo, latestVersion string) string {
 		}
 	}
 
-	line := fmt.Sprintf("%s%s%s%s", absColor, getPrefix(), budgetStr, ColorReset)
+	line := fmt.Sprintf("%s%s%s%s %s%s%s",
+		prefix, absColor, circleGlyph(percent), ColorReset, absColor, budgetStr, ColorReset)
 
-	if isProgressBarEnabled() {
-		elapsedFraction, hasTimeInfo := calculateElapsedFraction(info)
-		progressBar := renderProgressBar(percent, elapsedFraction, hasTimeInfo)
-		line += " " + progressBar
-	}
-
-	line += updateStr + resetStr
-
+	line += resetStr + updateStr + contextStr
 	return line
 }
 
 // formatError formats an error message with red color
-func formatError(msg string) string {
-	return fmt.Sprintf("%s%s%s%s", ColorRed, getPrefix(), msg, ColorReset)
+func formatError(msg string, input StatusInput) string {
+	return fmt.Sprintf("%s%s%s%s", ColorRed, getPrefix(input), msg, ColorReset)
 }
 
 func main() {
@@ -832,12 +782,11 @@ func main() {
 		return
 	}
 
-	// Consume stdin (Claude Code sends session data, but we don't use it)
-	_, _ = io.ReadAll(os.Stdin)
+	input := readStatusInput(os.Stdin)
 
 	token := getToken()
 	if token == "" {
-		fmt.Println(formatError("No API key"))
+		fmt.Println(formatError("No API key", input))
 		return
 	}
 
@@ -850,34 +799,34 @@ func main() {
 			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
 				percent := (bErr.Spend / bErr.MaxBudget) * 100
 				fmt.Printf("%s%s$%.2f/$%.2f (%.0f%%) | Budget exceeded%s\n",
-					ColorRed, getPrefix(), bErr.Spend, bErr.MaxBudget, percent, ColorReset)
+					ColorRed, getPrefix(input), bErr.Spend, bErr.MaxBudget, percent, ColorReset)
 			} else {
-				fmt.Println(formatError("Budget exceeded"))
+				fmt.Println(formatError("Budget exceeded", input))
 			}
 		case errors.Is(err, ErrAuth):
 			if debug {
-				fmt.Println(formatError("Auth error: " + err.Error()))
+				fmt.Println(formatError("Auth error: "+err.Error(), input))
 			} else {
-				fmt.Println(formatError("Auth error"))
+				fmt.Println(formatError("Auth error", input))
 			}
 		case strings.Contains(err.Error(), "timeout") ||
 			strings.Contains(err.Error(), "connection") ||
 			strings.Contains(err.Error(), "dial"):
 			if debug {
-				fmt.Println(formatError("Connection error: " + err.Error()))
+				fmt.Println(formatError("Connection error: "+err.Error(), input))
 			} else {
-				fmt.Println(formatError("Connection error"))
+				fmt.Println(formatError("Connection error", input))
 			}
 		default:
 			if debug {
-				fmt.Println(formatError("Error: " + err.Error()))
+				fmt.Println(formatError("Error: "+err.Error(), input))
 			} else {
-				fmt.Println(formatError("Error"))
+				fmt.Println(formatError("Error", input))
 			}
 		}
 		return
 	}
 
 	latestVersion := getLatestVersion()
-	fmt.Println(formatStatusLine(info, latestVersion))
+	fmt.Println(formatStatusLine(info, latestVersion, input))
 }

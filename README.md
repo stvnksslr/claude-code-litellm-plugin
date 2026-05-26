@@ -92,30 +92,27 @@ Add the statusline configuration to your Claude Code settings file:
 
 ## Output
 
-The plugin displays budget information in the following format:
+The plugin displays the active model, budget usage, and context-window pressure:
 
 ```
-LiteLLM: $4.69/$40.00 (12%) | weekly reset: 3d1h
+Opus 4.7: ○ 12% weekly reset: 3d1h | 📖 ◑ 45%
 ```
 
-- Green: 0-74% usage
-- Yellow: 75-89% usage
-- Red: 90%+ usage
+- **Prefix** is the model display name from Claude Code's stdin (falls back to `LiteLLM:` when stdin is unavailable). Override with `LITELLM_PLUGIN_PREFIX`.
+- **Circle gauge** fills clockwise as usage grows: `○` (empty) · `◔` (<30%) · `◑` (<60%) · `◕` (<85%) · `●` (full).
+- **Color** thresholds for the budget circle: green `< 75%`, yellow `75–89%`, red `90%+`.
+- **Reset countdown** shows time until the budget rolls over.
+- **Context segment (`📖 ●`)** reports the current context-window usage from Claude Code. Color thresholds: green `< 70%`, yellow `70–84%`, red `85%+`. Warn and critical bands append `— consider /compact` and `— run /compact or /clear` respectively. The segment is hidden when stdin doesn't include context data (e.g. before the first API call in a session).
 
-### Progress Bar with Pace Indicator
+![Status line examples](examples.svg)
 
-Disable the progress bar by setting:
+### Restoring dollar amounts
+
+Dollar amounts are hidden by default. To show `$spend/$budget (pct%)` instead of just the percentage:
 
 ```bash
-export LITELLM_PLUGIN_PROGRESS_BAR=false  # or 0
+export LITELLM_PLUGIN_SHOW_COST=1
 ```
-
-The progress bar has two components:
-
-- **Fill** (`█`) shows how much of the budget has been spent. Color follows the same green/yellow/red thresholds as the text.
-- **Pace marker** (`│`) shows how far through the budget period you are. It lets you see at a glance whether you're spending ahead of or behind pace.
-
-![Progress bar examples](examples.svg)
 
 ## Environment Variable Priority
 

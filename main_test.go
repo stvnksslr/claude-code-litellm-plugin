@@ -314,6 +314,10 @@ func TestParseISOTime(t *testing.T) {
 }
 
 func TestFormatStatusLine(t *testing.T) {
+	// Default-off SHOW_COST is the new normal; make sure no ambient env leaks in.
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+
 	spend25 := 25.0
 	spend75 := 75.0
 	spend95 := 95.0
@@ -321,46 +325,49 @@ func TestFormatStatusLine(t *testing.T) {
 	zeroSpend := 0.0
 
 	tests := []struct {
-		name           string
-		info           *KeyInfo
-		expectColor    string
-		expectContains []string
+		name              string
+		info              *KeyInfo
+		expectColor       string
+		expectContains    []string
+		expectNotContains []string
 	}{
 		{
-			name: "green color under 75%",
+			name: "green circle under 75%",
 			info: &KeyInfo{
 				Spend:     &spend25,
 				MaxBudget: &budget100,
 			},
-			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "$25.00/$100.00", "(25%)"},
+			expectColor:       ColorGreen,
+			expectContains:    []string{"◔", "25%"},
+			expectNotContains: []string{"$"},
 		},
 		{
-			name: "yellow color 75-90%",
+			name: "yellow circle 75-90%",
 			info: &KeyInfo{
 				Spend:     &spend75,
 				MaxBudget: &budget100,
 			},
-			expectColor:    ColorYellow,
-			expectContains: []string{"LiteLLM:", "$75.00/$100.00", "(75%)"},
+			expectColor:       ColorYellow,
+			expectContains:    []string{"◕", "75%"},
+			expectNotContains: []string{"$"},
 		},
 		{
-			name: "red color over 90%",
+			name: "red circle over 90%",
 			info: &KeyInfo{
 				Spend:     &spend95,
 				MaxBudget: &budget100,
 			},
 			expectColor:    ColorRed,
-			expectContains: []string{"LiteLLM:", "$95.00/$100.00", "(95%)"},
+			expectContains: []string{"●", "95%"}, // 95% lands in the "full" bucket (≥85)
 		},
 		{
-			name: "no budget limit",
+			name: "no budget limit shows spend in dollars",
 			info: &KeyInfo{
 				Spend:     &spend25,
 				MaxBudget: nil,
 			},
 			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "$25.00"},
+			expectContains: []string{"$25.00"},
 		},
 		{
 			name: "zero spend",
@@ -369,7 +376,7 @@ func TestFormatStatusLine(t *testing.T) {
 				MaxBudget: &budget100,
 			},
 			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "$0.00/$100.00", "(0%)"},
+			expectContains: []string{"○", "0%"},
 		},
 		{
 			name: "nil spend",
@@ -378,7 +385,7 @@ func TestFormatStatusLine(t *testing.T) {
 				MaxBudget: &budget100,
 			},
 			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "$0.00/$100.00", "(0%)"},
+			expectContains: []string{"○", "0%"},
 		},
 		{
 			name: "with reset time",
@@ -388,7 +395,7 @@ func TestFormatStatusLine(t *testing.T) {
 				BudgetResetAt: strPtr("2020-01-01T00:00:00Z"), // past time
 			},
 			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "reset:", "resetting"},
+			expectContains: []string{"◔", "reset:", "resetting"},
 		},
 		{
 			name: "with budget duration only (monthly)",
@@ -398,27 +405,7 @@ func TestFormatStatusLine(t *testing.T) {
 				BudgetDuration: strPtr("30d"),
 			},
 			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "reset:"},
-		},
-		{
-			name: "with budget duration only (daily)",
-			info: &KeyInfo{
-				Spend:          &spend25,
-				MaxBudget:      &budget100,
-				BudgetDuration: strPtr("1d"),
-			},
-			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "reset:"},
-		},
-		{
-			name: "with budget duration only (weekly)",
-			info: &KeyInfo{
-				Spend:          &spend25,
-				MaxBudget:      &budget100,
-				BudgetDuration: strPtr("7d"),
-			},
-			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "reset:"},
+			expectContains: []string{"◔", "reset:"},
 		},
 		{
 			name: "unknown budget duration shows unknown",
@@ -428,21 +415,27 @@ func TestFormatStatusLine(t *testing.T) {
 				BudgetDuration: strPtr("badformat"),
 			},
 			expectColor:    ColorGreen,
-			expectContains: []string{"LiteLLM:", "reset: unknown"},
+			expectContains: []string{"◔", "reset: unknown"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := formatStatusLine(tt.info, "")
+			result := formatStatusLine(tt.info, "", StatusInput{})
 
-			if !strings.HasPrefix(result, tt.expectColor) {
-				t.Errorf("expected result to start with color %q, got %q", tt.expectColor, result[:len(tt.expectColor)])
+			if !strings.Contains(result, tt.expectColor) {
+				t.Errorf("expected result to contain color %q, got %q", tt.expectColor, result)
 			}
 
 			for _, s := range tt.expectContains {
 				if !strings.Contains(result, s) {
 					t.Errorf("expected result to contain %q, got %q", s, result)
+				}
+			}
+
+			for _, s := range tt.expectNotContains {
+				if strings.Contains(result, s) {
+					t.Errorf("expected result NOT to contain %q, got %q", s, result)
 				}
 			}
 
@@ -454,7 +447,12 @@ func TestFormatStatusLine(t *testing.T) {
 }
 
 func TestFormatError(t *testing.T) {
-	result := formatError("Test error")
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+	if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := formatError("Test error", StatusInput{})
 
 	if !strings.HasPrefix(result, ColorRed) {
 		t.Errorf("expected error to start with red color")
@@ -531,35 +529,150 @@ func TestIsDebug(t *testing.T) {
 	})
 }
 
-func TestIsBetaEnabled(t *testing.T) {
-	t.Run("enabled with 1", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "1")
-		if !isProgressBarEnabled() {
-			t.Error("expected isProgressBarEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=1")
+func TestReadStatusInput(t *testing.T) {
+	t.Run("valid JSON with model and context", func(t *testing.T) {
+		in := strings.NewReader(`{"model":{"display_name":"Opus 4.7","id":"claude-opus-4-7"},"context_window":{"used_percentage":78.5}}`)
+		got := readStatusInput(in)
+		if got.Model.DisplayName != "Opus 4.7" {
+			t.Errorf("DisplayName = %q, want %q", got.Model.DisplayName, "Opus 4.7")
+		}
+		if got.Model.ID != "claude-opus-4-7" {
+			t.Errorf("ID = %q, want %q", got.Model.ID, "claude-opus-4-7")
+		}
+		if got.ContextWindow == nil || got.ContextWindow.UsedPercentage == nil || *got.ContextWindow.UsedPercentage != 78.5 {
+			t.Errorf("UsedPercentage missing or wrong: %+v", got.ContextWindow)
 		}
 	})
-	t.Run("enabled with true", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "true")
-		if !isProgressBarEnabled() {
-			t.Error("expected isProgressBarEnabled() = true when LITELLM_PLUGIN_BETA_FEATURES=true")
+	t.Run("null used_percentage", func(t *testing.T) {
+		in := strings.NewReader(`{"context_window":{"used_percentage":null}}`)
+		got := readStatusInput(in)
+		if got.ContextWindow == nil {
+			t.Fatal("expected non-nil ContextWindow")
+		}
+		if got.ContextWindow.UsedPercentage != nil {
+			t.Errorf("expected nil UsedPercentage, got %v", *got.ContextWindow.UsedPercentage)
 		}
 	})
-	t.Run("disabled when unset", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "")
-		if !isProgressBarEnabled() {
-			t.Error("expected isProgressBarEnabled() = true when unset")
+	t.Run("missing context_window", func(t *testing.T) {
+		in := strings.NewReader(`{"model":{"display_name":"Sonnet"}}`)
+		got := readStatusInput(in)
+		if got.ContextWindow != nil {
+			t.Errorf("expected nil ContextWindow, got %+v", got.ContextWindow)
 		}
 	})
-	t.Run("disabled with 0", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "0")
-		if isProgressBarEnabled() {
-			t.Error("expected isProgressBarEnabled() = false when LITELLM_PLUGIN_BETA_FEATURES=0")
+	t.Run("empty stdin yields zero value", func(t *testing.T) {
+		got := readStatusInput(strings.NewReader(""))
+		if got.Model.DisplayName != "" || got.ContextWindow != nil {
+			t.Errorf("expected zero value, got %+v", got)
 		}
 	})
-	t.Run("disabled with false", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_PROGRESS_BAR", "false")
-		if isProgressBarEnabled() {
-			t.Error("expected isProgressBarEnabled() = false when LITELLM_PLUGIN_BETA_FEATURES=false")
+	t.Run("malformed JSON yields zero value", func(t *testing.T) {
+		got := readStatusInput(strings.NewReader("not json"))
+		if got.Model.DisplayName != "" || got.ContextWindow != nil {
+			t.Errorf("expected zero value, got %+v", got)
+		}
+	})
+}
+
+func TestCircleGlyph(t *testing.T) {
+	tests := []struct {
+		pct  float64
+		want string
+	}{
+		{-5, "○"},
+		{0, "○"},
+		{1, "◔"},
+		{29, "◔"},
+		{30, "◑"},
+		{59, "◑"},
+		{60, "◕"},
+		{84, "◕"},
+		{85, "●"},
+		{100, "●"},
+		{150, "●"},
+	}
+	for _, tt := range tests {
+		if got := circleGlyph(tt.pct); got != tt.want {
+			t.Errorf("circleGlyph(%v) = %q, want %q", tt.pct, got, tt.want)
+		}
+	}
+}
+
+func TestContextColor(t *testing.T) {
+	tests := []struct {
+		pct  float64
+		want string
+	}{
+		{0, ColorGreen},
+		{69, ColorGreen},
+		{70, ColorYellow},
+		{84, ColorYellow},
+		{85, ColorRed},
+		{100, ColorRed},
+	}
+	for _, tt := range tests {
+		if got := contextColor(tt.pct); got != tt.want {
+			t.Errorf("contextColor(%v) = %q, want %q", tt.pct, got, tt.want)
+		}
+	}
+}
+
+func TestFormatContextSegment(t *testing.T) {
+	mk := func(pct *float64) StatusInput {
+		var in StatusInput
+		if pct != nil {
+			in.ContextWindow = &struct {
+				UsedPercentage *float64 `json:"used_percentage"`
+			}{UsedPercentage: pct}
+		}
+		return in
+	}
+	f := func(v float64) *float64 { return &v }
+
+	t.Run("absent context window omits segment", func(t *testing.T) {
+		if got := formatContextSegment(StatusInput{}); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+	t.Run("nil used_percentage omits segment", func(t *testing.T) {
+		if got := formatContextSegment(mk(nil)); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+	t.Run("low usage shows segment without suggestion", func(t *testing.T) {
+		got := formatContextSegment(mk(f(30)))
+		if !strings.Contains(got, "📖") || !strings.Contains(got, "◑") || !strings.Contains(got, "30%") {
+			t.Errorf("missing parts in %q", got)
+		}
+		if strings.Contains(got, "/compact") || strings.Contains(got, "/clear") {
+			t.Errorf("did not expect suggestion at 30%%, got %q", got)
+		}
+		if !strings.Contains(got, ColorGreen) {
+			t.Errorf("expected green at 30%%, got %q", got)
+		}
+	})
+	t.Run("warn threshold suggests /compact", func(t *testing.T) {
+		got := formatContextSegment(mk(f(78)))
+		if !strings.Contains(got, "consider /compact") {
+			t.Errorf("missing suggestion, got %q", got)
+		}
+		if !strings.Contains(got, ColorYellow) {
+			t.Errorf("expected yellow at 78%%, got %q", got)
+		}
+	})
+	t.Run("critical threshold urges /compact or /clear", func(t *testing.T) {
+		got := formatContextSegment(mk(f(92)))
+		if !strings.Contains(got, "run /compact or /clear") {
+			t.Errorf("missing urgent suggestion, got %q", got)
+		}
+		if !strings.Contains(got, ColorRed) {
+			t.Errorf("expected red at 92%%, got %q", got)
+		}
+	})
+	t.Run("clamps values above 100", func(t *testing.T) {
+		got := formatContextSegment(mk(f(150)))
+		if !strings.Contains(got, "100%") {
+			t.Errorf("expected clamped 100%%, got %q", got)
 		}
 	})
 }
@@ -815,7 +928,7 @@ func TestFormatStatusLineWithUpdate(t *testing.T) {
 	defer func() { Version = origVersion }()
 
 	Version = "v1.0.0"
-	result := formatStatusLine(info, "v1.1.0")
+	result := formatStatusLine(info, "v1.1.0", StatusInput{})
 	if !strings.Contains(result, "update: v1.1.0") {
 		t.Errorf("expected update notice, got %q", result)
 	}
@@ -833,30 +946,50 @@ func TestFormatStatusLineNoUpdate(t *testing.T) {
 	defer func() { Version = origVersion }()
 
 	Version = "v1.0.0"
-	result := formatStatusLine(info, "v1.0.0") // same version
+	result := formatStatusLine(info, "v1.0.0", StatusInput{})
 	if strings.Contains(result, "update:") {
 		t.Errorf("expected no update notice for same version, got %q", result)
 	}
 }
 
+func modelInput(name string) StatusInput {
+	var in StatusInput
+	in.Model.DisplayName = name
+	return in
+}
+
 func TestGetPrefix(t *testing.T) {
-	t.Run("default when unset", func(t *testing.T) {
+	t.Run("default when unset and no model", func(t *testing.T) {
 		if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
 			t.Fatal(err)
 		}
-		if got := getPrefix(); got != "LiteLLM: " {
+		if got := getPrefix(StatusInput{}); got != "LiteLLM: " {
 			t.Errorf("expected 'LiteLLM: ', got %q", got)
 		}
 	})
-	t.Run("blank when set to empty string", func(t *testing.T) {
+	t.Run("model display name used when env unset", func(t *testing.T) {
+		if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
+			t.Fatal(err)
+		}
+		if got := getPrefix(modelInput("Opus 4.7")); got != "Opus 4.7: " {
+			t.Errorf("expected 'Opus 4.7: ', got %q", got)
+		}
+	})
+	t.Run("env override beats model name", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_PREFIX", "Budget")
+		if got := getPrefix(modelInput("Opus 4.7")); got != "Budget " {
+			t.Errorf("expected 'Budget ', got %q", got)
+		}
+	})
+	t.Run("blank env override beats model name", func(t *testing.T) {
 		t.Setenv("LITELLM_PLUGIN_PREFIX", "")
-		if got := getPrefix(); got != "" {
+		if got := getPrefix(modelInput("Opus 4.7")); got != "" {
 			t.Errorf("expected empty string, got %q", got)
 		}
 	})
 	t.Run("custom prefix with trailing space", func(t *testing.T) {
 		t.Setenv("LITELLM_PLUGIN_PREFIX", "Budget")
-		if got := getPrefix(); got != "Budget " {
+		if got := getPrefix(StatusInput{}); got != "Budget " {
 			t.Errorf("expected 'Budget ', got %q", got)
 		}
 	})
@@ -867,17 +1000,28 @@ func TestFormatStatusLineShowCost(t *testing.T) {
 	budget := 65.0
 	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
 
-	t.Run("cost shown by default", func(t *testing.T) {
+	t.Run("cost hidden by default", func(t *testing.T) {
 		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
-		result := formatStatusLine(info, "")
-		if !strings.Contains(result, "$26.71") {
-			t.Errorf("expected dollar amounts in output, got %q", result)
+		result := formatStatusLine(info, "", StatusInput{})
+		if strings.Contains(result, "$") {
+			t.Errorf("expected no dollar amounts by default, got %q", result)
+		}
+		if !strings.Contains(result, "41%") {
+			t.Errorf("expected percentage in output, got %q", result)
 		}
 	})
 
 	t.Run("cost shown when set to 1", func(t *testing.T) {
 		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
-		result := formatStatusLine(info, "")
+		result := formatStatusLine(info, "", StatusInput{})
+		if !strings.Contains(result, "$26.71") {
+			t.Errorf("expected dollar amounts in output, got %q", result)
+		}
+	})
+
+	t.Run("cost shown when set to true", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "true")
+		result := formatStatusLine(info, "", StatusInput{})
 		if !strings.Contains(result, "$26.71") {
 			t.Errorf("expected dollar amounts in output, got %q", result)
 		}
@@ -885,18 +1029,7 @@ func TestFormatStatusLineShowCost(t *testing.T) {
 
 	t.Run("cost hidden when set to 0", func(t *testing.T) {
 		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "0")
-		result := formatStatusLine(info, "")
-		if strings.Contains(result, "$") {
-			t.Errorf("expected no dollar amounts in output, got %q", result)
-		}
-		if !strings.Contains(result, "41%") {
-			t.Errorf("expected percentage in output, got %q", result)
-		}
-	})
-
-	t.Run("cost hidden when set to false", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "false")
-		result := formatStatusLine(info, "")
+		result := formatStatusLine(info, "", StatusInput{})
 		if strings.Contains(result, "$") {
 			t.Errorf("expected no dollar amounts in output, got %q", result)
 		}
@@ -1051,6 +1184,11 @@ func TestResolveEffectiveBudget(t *testing.T) {
 }
 
 func TestFormatStatusLineTeamBudget(t *testing.T) {
+	// These tests exercise team-vs-key budget selection; pin SHOW_COST=1 so we
+	// can verify dollar values match the resolved source.
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "LiteLLM:")
+
 	keySpend := 10.0
 	teamSpend := 40.0
 	teamBudget := 100.0
@@ -1063,7 +1201,7 @@ func TestFormatStatusLineTeamBudget(t *testing.T) {
 			TeamMaxBudget:      &teamBudget,
 			TeamBudgetDuration: &duration,
 		}
-		result := formatStatusLine(info, "")
+		result := formatStatusLine(info, "", StatusInput{})
 		if !strings.Contains(result, "$40.00/$100.00") {
 			t.Errorf("expected team spend/budget in output, got %q", result)
 		}
@@ -1080,7 +1218,7 @@ func TestFormatStatusLineTeamBudget(t *testing.T) {
 			TeamSpend:     &teamSpend,
 			TeamMaxBudget: &teamBudget,
 		}
-		result := formatStatusLine(info, "")
+		result := formatStatusLine(info, "", StatusInput{})
 		if !strings.Contains(result, "$10.00/$50.00") {
 			t.Errorf("expected key spend/budget in output, got %q", result)
 		}
@@ -1190,7 +1328,8 @@ func TestGetKeyInfoMergesTeamBudget(t *testing.T) {
 	}
 
 	// formatStatusLine should show member budget, not raw spend
-	result := formatStatusLine(info, "")
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+	result := formatStatusLine(info, "", StatusInput{})
 	if !strings.Contains(result, "$4.00/$65.00") {
 		t.Errorf("expected $4.00/$65.00 in output, got %q", result)
 	}
@@ -1253,7 +1392,8 @@ func TestGetKeyInfoFallsBackToKeySpendWhenNoMembership(t *testing.T) {
 		t.Errorf("expected TeamSpend=%v (key spend fallback), got %v", keySpend, info.TeamSpend)
 	}
 
-	result := formatStatusLine(info, "")
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+	result := formatStatusLine(info, "", StatusInput{})
 	if !strings.Contains(result, "$1.33/$65.00") {
 		t.Errorf("expected $1.33/$65.00 in output, got %q", result)
 	}
@@ -1269,7 +1409,7 @@ func TestZeroBudgetDivision(t *testing.T) {
 	}
 
 	// Should not panic on zero budget
-	result := formatStatusLine(info, "")
+	result := formatStatusLine(info, "", StatusInput{})
 
 	// With zero budget, it should show just the spend (like no budget)
 	if !strings.Contains(result, "$10.00") {
@@ -1277,163 +1417,44 @@ func TestZeroBudgetDivision(t *testing.T) {
 	}
 }
 
-func TestRenderProgressBar(t *testing.T) {
-	tests := []struct {
-		name            string
-		percent         float64
-		elapsedFraction float64
-		hasTimeInfo     bool
-		wantContains    []string
-		wantNotContains []string
-	}{
-		{
-			name:            "partial fill without marker",
-			percent:         50,
-			hasTimeInfo:     false,
-			wantContains:    []string{"[", "]", "█", "░"},
-			wantNotContains: []string{"│"},
-		},
-		{
-			name:            "full fill at 100%",
-			percent:         100,
-			hasTimeInfo:     false,
-			wantContains:    []string{"█"},
-			wantNotContains: []string{"░"},
-		},
-		{
-			name:            "pace marker present with time info",
-			percent:         50,
-			elapsedFraction: 0.5,
-			hasTimeInfo:     true,
-			wantContains:    []string{"█", "│", "░"},
-		},
-		{
-			name:            "green marker when under budget",
-			percent:         25,
-			elapsedFraction: 0.5,
-			hasTimeInfo:     true,
-			wantContains:    []string{"│", ColorGreen},
-		},
-		{
-			name:            "yellow marker at projected 100%",
-			percent:         50,
-			elapsedFraction: 0.5,
-			hasTimeInfo:     true,
-			wantContains:    []string{"│", ColorYellow},
-		},
-		{
-			name:            "red marker when over projected budget",
-			percent:         80,
-			elapsedFraction: 0.5,
-			hasTimeInfo:     true,
-			wantContains:    []string{"│", ColorRed},
-		},
-		{
-			name:            "low elapsed skips pace projection",
-			percent:         50,
-			elapsedFraction: 0.02,
-			hasTimeInfo:     true,
-			wantContains:    []string{"│"},
-		},
+func TestFormatStatusLineWithModelAndContext(t *testing.T) {
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+	if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := renderProgressBar(tt.percent, tt.elapsedFraction, tt.hasTimeInfo)
-			for _, s := range tt.wantContains {
-				if !strings.Contains(result, s) {
-					t.Errorf("expected %q in result, got %q", s, result)
-				}
-			}
-			for _, s := range tt.wantNotContains {
-				if strings.Contains(result, s) {
-					t.Errorf("unexpected %q in result, got %q", s, result)
-				}
-			}
-		})
+	spend := 25.0
+	budget := 100.0
+	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+
+	pct := 78.0
+	in := StatusInput{}
+	in.Model.DisplayName = "Opus 4.7"
+	in.ContextWindow = &struct {
+		UsedPercentage *float64 `json:"used_percentage"`
+	}{UsedPercentage: &pct}
+
+	result := formatStatusLine(info, "", in)
+
+	if !strings.HasPrefix(result, "Opus 4.7: ") {
+		t.Errorf("expected model display name as prefix, got %q", result)
 	}
-}
-
-func TestCalculateBudgetPeriod(t *testing.T) {
-	durations := []struct {
-		name       string
-		duration   string
-		advance    time.Duration
-		wantPeriod time.Duration
-		wantOK     bool
-	}{
-		{"daily", "1d", 24 * time.Hour, 24 * time.Hour, true},
-		{"weekly", "7d", 7 * 24 * time.Hour, 7 * 24 * time.Hour, true},
-		{"custom 48h", "48h", 48 * time.Hour, 48 * time.Hour, true},
-		{"monthly alias", "monthly", 30 * 24 * time.Hour, 30 * 24 * time.Hour, true},
-		{"weekly alias", "weekly", 7 * 24 * time.Hour, 7 * 24 * time.Hour, true},
-		{"nil duration", "", 0, 0, false},
-		{"invalid duration", "invalid", 0, 0, false},
+	if !strings.Contains(result, "◔") {
+		t.Errorf("expected quarter-fill circle for 25%% budget, got %q", result)
 	}
-
-	for _, tt := range durations {
-		t.Run(tt.name, func(t *testing.T) {
-			var dur *string
-			if tt.duration != "" {
-				dur = strPtr(tt.duration)
-			}
-			info := &KeyInfo{BudgetDuration: dur}
-			if tt.wantOK {
-				resetAt := time.Now().UTC().Add(tt.advance).Format(time.RFC3339)
-				info.BudgetResetAt = strPtr(resetAt)
-			}
-			start, end, ok := calculateBudgetPeriod(info)
-			if ok != tt.wantOK {
-				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
-			}
-			if ok && end.Sub(start) != tt.wantPeriod {
-				t.Errorf("period = %v, want %v", end.Sub(start), tt.wantPeriod)
-			}
-		})
+	if !strings.Contains(result, "25%") {
+		t.Errorf("expected budget percentage, got %q", result)
 	}
-}
-
-func TestCalculateElapsedFraction(t *testing.T) {
-	t.Run("no duration returns false", func(t *testing.T) {
-		info := &KeyInfo{}
-		_, ok := calculateElapsedFraction(info)
-		if ok {
-			t.Error("expected ok=false with no duration")
-		}
-	})
-
-	t.Run("daily budget returns fraction between 0 and 1", func(t *testing.T) {
-		tomorrow := time.Now().UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
-		resetAt := tomorrow.Format(time.RFC3339)
-		info := &KeyInfo{
-			BudgetDuration: strPtr("1d"),
-			BudgetResetAt:  strPtr(resetAt),
-		}
-		frac, ok := calculateElapsedFraction(info)
-		if !ok {
-			t.Fatal("expected ok=true")
-		}
-		if frac < 0 || frac > 1.0 {
-			t.Errorf("elapsed fraction = %f, want [0, 1]", frac)
-		}
-		if frac == 0 {
-			t.Error("expected non-zero elapsed fraction mid-day")
-		}
-	})
-
-	t.Run("past reset returns clamped 1.0", func(t *testing.T) {
-		yesterday := time.Now().UTC().Add(-24 * time.Hour)
-		resetAt := yesterday.Format(time.RFC3339)
-		info := &KeyInfo{
-			BudgetDuration: strPtr("1d"),
-			BudgetResetAt:  strPtr(resetAt),
-		}
-		frac, ok := calculateElapsedFraction(info)
-		if !ok {
-			t.Fatal("expected ok=true")
-		}
-		if frac != 1.0 {
-			t.Errorf("elapsed fraction = %f, want 1.0 (clamped)", frac)
-		}
-	})
+	if !strings.Contains(result, "📖") {
+		t.Errorf("expected context book glyph, got %q", result)
+	}
+	if !strings.Contains(result, "◕") {
+		t.Errorf("expected three-quarter-fill circle for 78%% context, got %q", result)
+	}
+	if !strings.Contains(result, "78%") {
+		t.Errorf("expected context percentage, got %q", result)
+	}
+	if !strings.Contains(result, "consider /compact") {
+		t.Errorf("expected /compact suggestion at 78%%, got %q", result)
+	}
 }
