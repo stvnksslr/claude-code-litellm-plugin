@@ -406,15 +406,24 @@ func getKeyInfo(apiKey string) (*KeyInfo, error) {
 					}
 				}
 			}
-			if !memberSpendFound {
-				// No per-user membership row: use key-level spend, which tracks only
-				// this key's individual usage and resets on its own budget_reset_at.
-				info.TeamSpend = info.Spend
-			}
 			info.TeamBudgetResetAt = teamResp.TeamInfo.BudgetResetAt
 			if teamResp.TeamInfo.TeamMemberBudgetTable != nil {
 				info.TeamMaxBudget = teamResp.TeamInfo.TeamMemberBudgetTable.MaxBudget
 				info.TeamBudgetDuration = teamResp.TeamInfo.TeamMemberBudgetTable.BudgetDuration
+				if !memberSpendFound {
+					info.TeamSpend = info.Spend
+				}
+			} else if teamResp.TeamInfo.MaxBudget != nil {
+				info.TeamMaxBudget = teamResp.TeamInfo.MaxBudget
+				if !memberSpendFound {
+					if teamResp.TeamInfo.Spend != nil {
+						info.TeamSpend = teamResp.TeamInfo.Spend
+					} else {
+						info.TeamSpend = info.Spend
+					}
+				}
+			} else if !memberSpendFound {
+				info.TeamSpend = info.Spend
 			}
 			if info.TeamBudgetDuration == nil {
 				info.TeamBudgetDuration = teamResp.TeamInfo.BudgetDuration

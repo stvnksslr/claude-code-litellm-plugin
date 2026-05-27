@@ -1399,6 +1399,63 @@ func TestGetKeyInfoFallsBackToKeySpendWhenNoMembership(t *testing.T) {
 	}
 }
 
+func TestGetKeyInfoFallsBackToTeamLevelBudget(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	keySpend := 3.0
+	teamBudget := 500.0
+	teamSpend := 120.0
+	teamDuration := "30d"
+	resetAt := "2026-06-01T00:00:00Z"
+	teamID := "team-eng"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/key/info":
+			resp := KeyInfoResponse{
+				Info: KeyInfo{
+					Spend:  &keySpend,
+					TeamID: &teamID,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/team/info":
+			resp := TeamInfoAPIResponse{
+				TeamInfo: TeamInfoData{
+					Spend:          &teamSpend,
+					MaxBudget:      &teamBudget,
+					BudgetDuration: &teamDuration,
+					BudgetResetAt:  &resetAt,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	info, err := getKeyInfo("test-token")
+	if err != nil {
+		t.Fatalf("getKeyInfo() error = %v", err)
+	}
+	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != teamBudget {
+		t.Errorf("expected TeamMaxBudget=%v, got %v", teamBudget, info.TeamMaxBudget)
+	}
+	if info.TeamSpend == nil || *info.TeamSpend != teamSpend {
+		t.Errorf("expected TeamSpend=%v (team total), got %v", teamSpend, info.TeamSpend)
+	}
+
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+	result := formatStatusLine(info, "", StatusInput{})
+	if !strings.Contains(result, "$120.00/$500.00") {
+		t.Errorf("expected $120.00/$500.00 in output, got %q", result)
+	}
+}
+
 func TestZeroBudgetDivision(t *testing.T) {
 	spend := 10.0
 	zeroBudget := 0.0
