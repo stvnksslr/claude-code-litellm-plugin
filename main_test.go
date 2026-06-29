@@ -1280,7 +1280,7 @@ func TestGetKeyInfoUsesMembershipBudget(t *testing.T) {
 	memberDuration := "7d"
 	resetAt := "2026-04-06T00:00:00Z"
 	teamID := "team-123"
-	userID := "steven.kessler@pitchbook.com"
+	userID := "john.doe@example.com"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1354,8 +1354,8 @@ func TestGetKeyInfoIgnoresKeySpendWhenNoMembership(t *testing.T) {
 	memberDuration := "7d"
 	resetAt := "2026-04-13T00:00:00Z"
 	teamID := "team-pfe-sat"
-	userID := "steven.kessler@pitchbook.com"
-	otherUserID := "other.user@pitchbook.com"
+	userID := "john.doe@example.com"
+	otherUserID := "other.user@example.com"
 	otherSpend := 12.80
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
