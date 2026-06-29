@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +33,7 @@ const (
 // Cache configuration
 const (
 	CacheTTLMs         = 30_000          // 30 seconds in milliseconds
+	BudgetFailTTLMs    = 10_000          // negative-cache window for failed budget fetches
 	HTTPTimeout        = 3 * time.Second // fast failure for subprocess/statusline use
 	UpdateCheckTTLMs   = 60 * 60 * 1_000 // 1 hour in milliseconds
 	UpdateCheckTimeout = 5 * time.Second
@@ -73,6 +77,28 @@ type UpdateCacheEntry struct {
 	LatestVersion string `json:"latest_version"`
 }
 
+// BudgetFailEntry is the on-disk negative-cache record of a failed budget fetch.
+// It captures enough to reconstruct an equivalent error (so main()'s classification
+// keeps working) without making another network call within BudgetFailTTLMs.
+type BudgetFailEntry struct {
+	Timestamp int64   `json:"timestamp"`            // Unix milliseconds
+	Kind      string  `json:"kind"`                 // "auth" | "budget" | "transport"
+	Message   string  `json:"message,omitempty"`    // original error text, for debug output
+	Spend     float64 `json:"spend,omitempty"`      // populated when Kind == "budget"
+	MaxBudget float64 `json:"max_budget,omitempty"` // populated when Kind == "budget"
+}
+
+// cachedError reconstructs a previously-seen fetch error from the negative cache.
+// Unwrap exposes a sentinel (e.g. ErrAuth) so errors.Is still matches, while Error
+// preserves the original message for debug output. A nil sentinel matches nothing.
+type cachedError struct {
+	msg      string
+	sentinel error
+}
+
+func (c *cachedError) Error() string { return c.msg }
+func (c *cachedError) Unwrap() error { return c.sentinel }
+
 // KeyInfoResponse represents the API response structure
 type KeyInfoResponse struct {
 	Info KeyInfo `json:"info"`
@@ -93,10 +119,12 @@ type KeyInfo struct {
 	TeamBudgetDuration *string  `json:"team_budget_duration"`
 }
 
-// TeamMemberBudgetTable holds the per-user budget within a team.
+// TeamMemberBudgetTable holds the per-user budget within a team. It backs both
+// team_info.team_member_budget_table and each team_memberships[].litellm_budget_table.
 type TeamMemberBudgetTable struct {
 	MaxBudget      *float64 `json:"max_budget"`
 	BudgetDuration *string  `json:"budget_duration"`
+	BudgetResetAt  *string  `json:"budget_reset_at"`
 }
 
 // TeamInfoData is the nested team_info object in the /team/info response.
@@ -109,10 +137,13 @@ type TeamInfoData struct {
 }
 
 // TeamMembership represents a single entry in the team_memberships array.
+// LitellmBudgetTable carries this member's own budget — on many LiteLLM instances
+// the per-member budget lives here rather than in team_info.
 type TeamMembership struct {
-	UserID string   `json:"user_id"`
-	TeamID string   `json:"team_id"`
-	Spend  *float64 `json:"spend"`
+	UserID             string                 `json:"user_id"`
+	TeamID             string                 `json:"team_id"`
+	Spend              *float64               `json:"spend"`
+	LitellmBudgetTable *TeamMemberBudgetTable `json:"litellm_budget_table"`
 }
 
 // TeamInfoAPIResponse is the top-level /team/info response.
@@ -121,13 +152,11 @@ type TeamInfoAPIResponse struct {
 	TeamMemberships []TeamMembership `json:"team_memberships"`
 }
 
-// resolveEffectiveBudget returns a *KeyInfo populated with the most relevant budget
-// information. Key-level budget takes priority; team-level budget is used as fallback
-// when the key has no budget of its own.
+// resolveEffectiveBudget returns a *KeyInfo populated with the budget to display.
+// The team budget is the only source of truth — key-level spend/budget is intentionally
+// ignored to avoid confusing fallbacks. When no team budget exists, an empty *KeyInfo is
+// returned so no key spend leaks into the statusline.
 func resolveEffectiveBudget(info *KeyInfo) *KeyInfo {
-	if info.MaxBudget != nil && *info.MaxBudget > 0 {
-		return info
-	}
 	if info.TeamMaxBudget != nil && *info.TeamMaxBudget > 0 {
 		return &KeyInfo{
 			Spend:          info.TeamSpend,
@@ -136,7 +165,7 @@ func resolveEffectiveBudget(info *KeyInfo) *KeyInfo {
 			BudgetDuration: info.TeamBudgetDuration,
 		}
 	}
-	return info
+	return &KeyInfo{}
 }
 
 // GitHubRelease represents the GitHub releases API response
@@ -175,12 +204,60 @@ func cacheDir() string {
 	return filepath.Join(home, ".cache", "claude-code-litellm")
 }
 
-func budgetCacheFile() string {
-	return filepath.Join(cacheDir(), "budget.json")
+// cacheKey returns a short, stable hash of the active base URL + token so budget
+// cache files don't bleed across different proxies/keys (e.g. per-project configs
+// that point at different LiteLLM instances or use different keys).
+func cacheKey() string {
+	sum := sha256.Sum256([]byte(getBaseURL() + "\x00" + getToken()))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
+func budgetCacheFile() string {
+	return filepath.Join(cacheDir(), "budget-"+cacheKey()+".json")
+}
+
+// budgetFailCacheFile holds the negative-cache marker for failed budget fetches.
+// Namespaced per-key so a failure for one key doesn't suppress fetches for another.
+func budgetFailCacheFile() string {
+	return filepath.Join(cacheDir(), "budget-fail-"+cacheKey()+".json")
+}
+
+// updateCacheFile is intentionally NOT namespaced by key: the latest GitHub release
+// is identical regardless of which LiteLLM key/URL is in use, and a shared file means
+// a single backoff is honored across keys (fewer GitHub calls under rate limits).
 func updateCacheFile() string {
 	return filepath.Join(cacheDir(), "update.json")
+}
+
+// writeFileAtomic writes data to path atomically: it writes to a uniquely-named temp
+// file in the same directory, then renames it into place. Rename is atomic on the same
+// filesystem, so concurrent statusline processes (or goroutines) never observe a torn
+// file. The directory must already exist.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // readBudgetCache reads cached budget info from disk.
@@ -217,7 +294,64 @@ func writeBudgetCache(info *KeyInfo) {
 	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
 		return
 	}
-	_ = os.WriteFile(budgetCacheFile(), data, 0o600)
+	_ = writeFileAtomic(budgetCacheFile(), data, 0o600)
+}
+
+// readBudgetFailCache returns a recent failed-fetch record, if one exists within
+// BudgetFailTTLMs. Returns nil, false when absent, corrupt, or expired.
+func readBudgetFailCache() (*BudgetFailEntry, bool) {
+	data, err := os.ReadFile(budgetFailCacheFile())
+	if err != nil {
+		return nil, false
+	}
+	var entry BudgetFailEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, false
+	}
+	if time.Now().UnixMilli()-entry.Timestamp >= BudgetFailTTLMs {
+		return nil, false
+	}
+	return &entry, true
+}
+
+// writeBudgetFailCache records a failed budget fetch so subsequent refreshes back off
+// instead of re-blocking on the network. Errors are silently ignored — best-effort.
+func writeBudgetFailCache(fetchErr error) {
+	entry := BudgetFailEntry{
+		Timestamp: time.Now().UnixMilli(),
+		Message:   fetchErr.Error(),
+		Kind:      "transport",
+	}
+	var bErr *BudgetExceededError
+	switch {
+	case errors.As(fetchErr, &bErr):
+		entry.Kind = "budget"
+		entry.Spend = bErr.Spend
+		entry.MaxBudget = bErr.MaxBudget
+	case errors.Is(fetchErr, ErrAuth):
+		entry.Kind = "auth"
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		return
+	}
+	_ = writeFileAtomic(budgetFailCacheFile(), data, 0o600)
+}
+
+// errorFromFailEntry rebuilds an error equivalent to the original failed fetch so
+// callers (and main()'s error classification) behave identically without a network call.
+func errorFromFailEntry(e *BudgetFailEntry) error {
+	switch e.Kind {
+	case "budget":
+		return &BudgetExceededError{Spend: e.Spend, MaxBudget: e.MaxBudget}
+	case "auth":
+		return &cachedError{msg: e.Message, sentinel: ErrAuth}
+	default:
+		return &cachedError{msg: e.Message}
+	}
 }
 
 // readUpdateCache reads the cached latest GitHub release version from disk.
@@ -238,11 +372,11 @@ func readUpdateCache() (string, bool) {
 }
 
 // writeUpdateCache persists the latest version string to disk.
+// An empty version is persisted deliberately: it records "checked, nothing newer
+// (or the check failed)" so a failed/rate-limited GitHub call backs off for the full
+// TTL instead of being retried — and re-blocking — on every statusline refresh.
 // Errors are silently ignored — caching is best-effort.
 func writeUpdateCache(version string) {
-	if version == "" {
-		return
-	}
 	entry := UpdateCacheEntry{
 		Timestamp:     time.Now().UnixMilli(),
 		LatestVersion: version,
@@ -254,7 +388,7 @@ func writeUpdateCache(version string) {
 	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
 		return
 	}
-	_ = os.WriteFile(updateCacheFile(), data, 0o600)
+	_ = writeFileAtomic(updateCacheFile(), data, 0o600)
 }
 
 // fetchLatestVersion calls the GitHub releases API to get the latest release tag
@@ -293,9 +427,9 @@ func getLatestVersion() string {
 		return version
 	}
 	latest := fetchLatestVersion()
-	if latest != "" {
-		writeUpdateCache(latest)
-	}
+	// Persist even on "" (failure / rate-limit) so the next refresh reads the cache
+	// and backs off rather than re-attempting the network call.
+	writeUpdateCache(latest)
 	return latest
 }
 
@@ -380,53 +514,62 @@ func getPrefix(input StatusInput) string {
 // getKeyInfo fetches budget info from the LiteLLM API, using a 30-second filesystem cache
 // to avoid hitting the API on every statusline refresh.
 // Each invocation of this binary is a fresh process, so all state must live on disk.
-// When the key has a team_id and no key-level max_budget, a second call to /team/info
-// is made to populate team membership budget fields.
+// When the key has a team_id, a second call to /team/info populates the team budget
+// fields — the only budget the statusline displays (key-level budget is ignored).
 func getKeyInfo(apiKey string) (*KeyInfo, error) {
 	if info, ok := readBudgetCache(); ok {
 		return info, nil
 	}
+	// Recent failure → back off and replay the cached error instead of re-blocking
+	// on the network every refresh while the proxy is down / key is bad / over budget.
+	if failed, ok := readBudgetFailCache(); ok {
+		return nil, errorFromFailEntry(failed)
+	}
 	info, err := fetchKeyInfo(apiKey)
 	if err != nil {
+		writeBudgetFailCache(err)
 		return nil, err
 	}
-	if info.TeamID != nil && *info.TeamID != "" && (info.MaxBudget == nil || *info.MaxBudget <= 0) {
+	if info.TeamID != nil && *info.TeamID != "" {
 		if teamResp, err := fetchTeamInfo(apiKey, *info.TeamID); err == nil {
-			// Use the team member's own spend from team_memberships if available,
-			// falling back to the team's total spend. The key's spend field has no
-			// budget_duration and never resets, so it would look like the budget
-			// never resets even though team/membership spend does.
-			memberSpendFound := false
+			ti := teamResp.TeamInfo
+			// Primary source: this member's own per-member budget from team_memberships.
+			// Both the budget and its matching spend come from the same membership row;
+			// the key's own spend is never used (it tracks a different, confusing window).
 			if info.UserID != nil && *info.UserID != "" {
 				for _, m := range teamResp.TeamMemberships {
-					if m.UserID == *info.UserID && m.Spend != nil {
+					if m.UserID != *info.UserID {
+						continue
+					}
+					if m.LitellmBudgetTable != nil && m.LitellmBudgetTable.MaxBudget != nil {
 						info.TeamSpend = m.Spend
-						memberSpendFound = true
-						break
+						info.TeamMaxBudget = m.LitellmBudgetTable.MaxBudget
+						info.TeamBudgetDuration = m.LitellmBudgetTable.BudgetDuration
+						info.TeamBudgetResetAt = m.LitellmBudgetTable.BudgetResetAt
 					}
+					break
 				}
 			}
-			info.TeamBudgetResetAt = teamResp.TeamInfo.BudgetResetAt
-			if teamResp.TeamInfo.TeamMemberBudgetTable != nil {
-				info.TeamMaxBudget = teamResp.TeamInfo.TeamMemberBudgetTable.MaxBudget
-				info.TeamBudgetDuration = teamResp.TeamInfo.TeamMemberBudgetTable.BudgetDuration
-				if !memberSpendFound {
-					info.TeamSpend = info.Spend
+			// Fallback for instances that expose the budget at the team level instead:
+			// team_member_budget_table, else the team's own max_budget. Spend is paired
+			// with the team total — again, never the key's spend.
+			if info.TeamMaxBudget == nil {
+				switch {
+				case ti.TeamMemberBudgetTable != nil && ti.TeamMemberBudgetTable.MaxBudget != nil:
+					info.TeamMaxBudget = ti.TeamMemberBudgetTable.MaxBudget
+					info.TeamBudgetDuration = ti.TeamMemberBudgetTable.BudgetDuration
+				case ti.MaxBudget != nil:
+					info.TeamMaxBudget = ti.MaxBudget
 				}
-			} else if teamResp.TeamInfo.MaxBudget != nil {
-				info.TeamMaxBudget = teamResp.TeamInfo.MaxBudget
-				if !memberSpendFound {
-					if teamResp.TeamInfo.Spend != nil {
-						info.TeamSpend = teamResp.TeamInfo.Spend
-					} else {
-						info.TeamSpend = info.Spend
+				if info.TeamMaxBudget != nil {
+					info.TeamSpend = ti.Spend
+					if info.TeamBudgetResetAt == nil {
+						info.TeamBudgetResetAt = ti.BudgetResetAt
+					}
+					if info.TeamBudgetDuration == nil {
+						info.TeamBudgetDuration = ti.BudgetDuration
 					}
 				}
-			} else if !memberSpendFound {
-				info.TeamSpend = info.Spend
-			}
-			if info.TeamBudgetDuration == nil {
-				info.TeamBudgetDuration = teamResp.TeamInfo.BudgetDuration
 			}
 		}
 	}
@@ -491,10 +634,10 @@ func fetchTeamInfo(apiKey, teamID string) (*TeamInfoAPIResponse, error) {
 	if baseURL == "" {
 		return nil, fmt.Errorf("no LiteLLM proxy URL configured")
 	}
-	url := baseURL + "/team/info?team_id=" + teamID
+	endpoint := baseURL + "/team/info?team_id=" + url.QueryEscape(teamID)
 
 	client := &http.Client{Timeout: HTTPTimeout}
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -748,8 +891,8 @@ func formatStatusLine(info *KeyInfo, latestVersion string, input StatusInput) st
 	prefix := getPrefix(input)
 
 	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
-		// No budget set — show spend in dollars (the only data we have).
-		return fmt.Sprintf("%s%s$%.2f%s%s%s", ColorGreen, prefix, spend, ColorReset, updateStr, contextStr)
+		// No team budget resolved — key-level spend is intentionally not shown as a fallback.
+		return formatError("no budget configured", input)
 	}
 
 	budget := *info.MaxBudget

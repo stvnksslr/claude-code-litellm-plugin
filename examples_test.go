@@ -141,68 +141,69 @@ func TestGenerateExamples(t *testing.T) {
 	spend35 := 35.0 // 70%  → ◕
 	spend48 := 48.0 // 96%  → ●
 	resetAt := weeklyResetAt(0.5)
+	// Budgets are team-member budgets — the only budget the statusline displays.
 	examples := []statusExample{
 		{
 			label: "Empty budget (0%) — ○",
-			info:  &KeyInfo{Spend: &spend0, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend0, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", nil),
 		},
 		{
 			label: "Quarter budget (20%) — ◔",
-			info:  &KeyInfo{Spend: &spend10, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend10, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", nil),
 		},
 		{
 			label: "Half budget (40%) — ◑",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", nil),
 		},
 		{
 			label: "Three-quarter budget (70%) — ◕",
-			info:  &KeyInfo{Spend: &spend35, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend35, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", nil),
 		},
 		{
 			label: "Full budget (96%) — ●",
-			info:  &KeyInfo{Spend: &spend48, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend48, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", nil),
 		},
 		{
 			label: "Context segment — low (no suggestion)",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", f64(30)),
 		},
 		{
 			label: "Context segment — warn (consider /compact)",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", f64(78)),
 		},
 		{
 			label: "Context segment — critical (run /compact or /clear)",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", f64(92)),
 		},
 		{
 			label: "Dollar amounts restored",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", f64(45)),
 			env:   map[string]string{"LITELLM_PLUGIN_SHOW_COST": "1"},
 		},
 		{
 			label: "Custom prefix wins over model name",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 			input: ctxInput("Opus 4.7", f64(45)),
 			env:   map[string]string{"LITELLM_PLUGIN_PREFIX": "💰"},
 		},
 		{
+			// Key spend present but no team budget → the red no-budget state (key spend is ignored).
 			label: "No budget configured",
 			info:  &KeyInfo{Spend: &spend20},
 			input: ctxInput("Opus 4.7", f64(45)),
 		},
 		{
-			label: "Team budget (no key budget)",
+			label: "Team budget",
 			info: &KeyInfo{
-				Spend:              &spend20,
 				TeamSpend:          &spend20,
 				TeamMaxBudget:      &budget,
 				TeamBudgetResetAt:  &resetAt,
@@ -212,7 +213,7 @@ func TestGenerateExamples(t *testing.T) {
 		},
 		{
 			label: "Falls back to LiteLLM: when no stdin",
-			info:  &KeyInfo{Spend: &spend20, MaxBudget: &budget, BudgetResetAt: &resetAt, BudgetDuration: &weekly},
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
 		},
 	}
 

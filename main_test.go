@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -334,8 +335,8 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "green circle under 75%",
 			info: &KeyInfo{
-				Spend:     &spend25,
-				MaxBudget: &budget100,
+				TeamSpend:     &spend25,
+				TeamMaxBudget: &budget100,
 			},
 			expectColor:       ColorGreen,
 			expectContains:    []string{"◔", "25%"},
@@ -344,8 +345,8 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "yellow circle 75-90%",
 			info: &KeyInfo{
-				Spend:     &spend75,
-				MaxBudget: &budget100,
+				TeamSpend:     &spend75,
+				TeamMaxBudget: &budget100,
 			},
 			expectColor:       ColorYellow,
 			expectContains:    []string{"◕", "75%"},
@@ -354,26 +355,27 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "red circle over 90%",
 			info: &KeyInfo{
-				Spend:     &spend95,
-				MaxBudget: &budget100,
+				TeamSpend:     &spend95,
+				TeamMaxBudget: &budget100,
 			},
 			expectColor:    ColorRed,
 			expectContains: []string{"●", "95%"}, // 95% lands in the "full" bucket (≥85)
 		},
 		{
-			name: "no budget limit shows spend in dollars",
+			name: "no team budget shows error, never key spend",
 			info: &KeyInfo{
-				Spend:     &spend25,
-				MaxBudget: nil,
+				Spend:         &spend25, // key spend present but must be ignored
+				TeamMaxBudget: nil,
 			},
-			expectColor:    ColorGreen,
-			expectContains: []string{"$25.00"},
+			expectColor:       ColorRed,
+			expectContains:    []string{"no budget configured"},
+			expectNotContains: []string{"$"},
 		},
 		{
 			name: "zero spend",
 			info: &KeyInfo{
-				Spend:     &zeroSpend,
-				MaxBudget: &budget100,
+				TeamSpend:     &zeroSpend,
+				TeamMaxBudget: &budget100,
 			},
 			expectColor:    ColorGreen,
 			expectContains: []string{"○", "0%"},
@@ -381,8 +383,8 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "nil spend",
 			info: &KeyInfo{
-				Spend:     nil,
-				MaxBudget: &budget100,
+				TeamSpend:     nil,
+				TeamMaxBudget: &budget100,
 			},
 			expectColor:    ColorGreen,
 			expectContains: []string{"○", "0%"},
@@ -390,9 +392,9 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "with reset time",
 			info: &KeyInfo{
-				Spend:         &spend25,
-				MaxBudget:     &budget100,
-				BudgetResetAt: strPtr("2020-01-01T00:00:00Z"), // past time
+				TeamSpend:         &spend25,
+				TeamMaxBudget:     &budget100,
+				TeamBudgetResetAt: strPtr("2020-01-01T00:00:00Z"), // past time
 			},
 			expectColor:    ColorGreen,
 			expectContains: []string{"◔", "reset:", "resetting"},
@@ -400,9 +402,9 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "with budget duration only (monthly)",
 			info: &KeyInfo{
-				Spend:          &spend25,
-				MaxBudget:      &budget100,
-				BudgetDuration: strPtr("30d"),
+				TeamSpend:          &spend25,
+				TeamMaxBudget:      &budget100,
+				TeamBudgetDuration: strPtr("30d"),
 			},
 			expectColor:    ColorGreen,
 			expectContains: []string{"◔", "reset:"},
@@ -410,9 +412,9 @@ func TestFormatStatusLine(t *testing.T) {
 		{
 			name: "unknown budget duration shows unknown",
 			info: &KeyInfo{
-				Spend:          &spend25,
-				MaxBudget:      &budget100,
-				BudgetDuration: strPtr("badformat"),
+				TeamSpend:          &spend25,
+				TeamMaxBudget:      &budget100,
+				TeamBudgetDuration: strPtr("badformat"),
 			},
 			expectColor:    ColorGreen,
 			expectContains: []string{"◔", "reset: unknown"},
@@ -921,7 +923,7 @@ func TestIsUpdateAvailable(t *testing.T) {
 func TestFormatStatusLineWithUpdate(t *testing.T) {
 	spend := 25.0
 	budget := 100.0
-	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+	info := &KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget}
 
 	// Save and restore Version
 	origVersion := Version
@@ -940,7 +942,7 @@ func TestFormatStatusLineWithUpdate(t *testing.T) {
 func TestFormatStatusLineNoUpdate(t *testing.T) {
 	spend := 25.0
 	budget := 100.0
-	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+	info := &KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget}
 
 	origVersion := Version
 	defer func() { Version = origVersion }()
@@ -998,7 +1000,7 @@ func TestGetPrefix(t *testing.T) {
 func TestFormatStatusLineShowCost(t *testing.T) {
 	spend := 26.71
 	budget := 65.0
-	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+	info := &KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget}
 
 	t.Run("cost hidden by default", func(t *testing.T) {
 		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
@@ -1111,7 +1113,6 @@ func TestResolveEffectiveBudget(t *testing.T) {
 	keyBudget := 50.0
 	teamSpend := 25.0
 	teamBudget := 100.0
-	zeroBudget := 0.0
 	resetAt := "2025-01-15T10:00:00Z"
 	duration := "30d"
 
@@ -1123,18 +1124,18 @@ func TestResolveEffectiveBudget(t *testing.T) {
 		wantNilBudget bool
 	}{
 		{
-			name: "key budget present — key budget used",
+			name: "team budget used; key budget ignored",
 			info: &KeyInfo{
 				Spend:         &keySpend,
-				MaxBudget:     &keyBudget,
+				MaxBudget:     &keyBudget, // present but must be ignored
 				TeamSpend:     &teamSpend,
 				TeamMaxBudget: &teamBudget,
 			},
-			wantSpend:     keySpend,
-			wantMaxBudget: keyBudget,
+			wantSpend:     teamSpend,
+			wantMaxBudget: teamBudget,
 		},
 		{
-			name: "no key budget — team budget used",
+			name: "team budget with reset/duration",
 			info: &KeyInfo{
 				Spend:              &keySpend,
 				TeamSpend:          &teamSpend,
@@ -1146,20 +1147,8 @@ func TestResolveEffectiveBudget(t *testing.T) {
 			wantMaxBudget: teamBudget,
 		},
 		{
-			name: "key budget zero — team budget used",
-			info: &KeyInfo{
-				Spend:         &keySpend,
-				MaxBudget:     &zeroBudget,
-				TeamSpend:     &teamSpend,
-				TeamMaxBudget: &teamBudget,
-			},
-			wantSpend:     teamSpend,
-			wantMaxBudget: teamBudget,
-		},
-		{
-			name:          "no budgets — passthrough",
-			info:          &KeyInfo{Spend: &keySpend},
-			wantSpend:     keySpend,
+			name:          "no team budget — empty, key spend not leaked",
+			info:          &KeyInfo{Spend: &keySpend, MaxBudget: &keyBudget},
 			wantNilBudget: true,
 		},
 	}
@@ -1170,6 +1159,9 @@ func TestResolveEffectiveBudget(t *testing.T) {
 			if tt.wantNilBudget {
 				if got.MaxBudget != nil && *got.MaxBudget > 0 {
 					t.Errorf("expected nil/zero MaxBudget, got %v", *got.MaxBudget)
+				}
+				if got.Spend != nil {
+					t.Errorf("expected no spend to leak, got %v", *got.Spend)
 				}
 				return
 			}
@@ -1210,17 +1202,20 @@ func TestFormatStatusLineTeamBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("key budget takes priority over team budget", func(t *testing.T) {
+	t.Run("key budget ignored when team budget present", func(t *testing.T) {
 		keyBudget := 50.0
 		info := &KeyInfo{
 			Spend:         &keySpend,
-			MaxBudget:     &keyBudget,
+			MaxBudget:     &keyBudget, // present but must be ignored
 			TeamSpend:     &teamSpend,
 			TeamMaxBudget: &teamBudget,
 		}
 		result := formatStatusLine(info, "", StatusInput{})
-		if !strings.Contains(result, "$10.00/$50.00") {
-			t.Errorf("expected key spend/budget in output, got %q", result)
+		if !strings.Contains(result, "$40.00/$100.00") {
+			t.Errorf("expected team spend/budget (key ignored), got %q", result)
+		}
+		if strings.Contains(result, "$10.00") || strings.Contains(result, "$50.00") {
+			t.Errorf("key spend/budget must not appear, got %q", result)
 		}
 	})
 }
@@ -1273,36 +1268,43 @@ func TestFetchTeamInfo(t *testing.T) {
 	}
 }
 
-func TestGetKeyInfoMergesTeamBudget(t *testing.T) {
+// TestGetKeyInfoUsesMembershipBudget covers the primary source: the per-member budget
+// in team_memberships[].litellm_budget_table, paired with the membership's own spend.
+// The key's own spend is present but must be ignored.
+func TestGetKeyInfoUsesMembershipBudget(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	keySpend := 4.0
+	keySpend := 16.54 // present on the key but must be ignored
+	memberSpend := 4.0
 	memberBudget := 65.0
 	memberDuration := "7d"
 	resetAt := "2026-04-06T00:00:00Z"
 	teamID := "team-123"
-	keyDuration := "7d"
+	userID := "steven.kessler@pitchbook.com"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/key/info":
 			resp := KeyInfoResponse{
 				Info: KeyInfo{
-					Spend:          &keySpend,
-					TeamID:         &teamID,
-					BudgetDuration: &keyDuration,
-					BudgetResetAt:  &resetAt,
+					Spend:  &keySpend,
+					TeamID: &teamID,
+					UserID: &userID,
 				},
 			}
 			_ = json.NewEncoder(w).Encode(resp)
 		case "/team/info":
 			resp := TeamInfoAPIResponse{
-				TeamInfo: TeamInfoData{
-					BudgetDuration: &memberDuration,
-					BudgetResetAt:  &resetAt,
-					TeamMemberBudgetTable: &TeamMemberBudgetTable{
-						MaxBudget:      &memberBudget,
-						BudgetDuration: &memberDuration,
+				TeamMemberships: []TeamMembership{
+					{
+						UserID: userID,
+						TeamID: teamID,
+						Spend:  &memberSpend,
+						LitellmBudgetTable: &TeamMemberBudgetTable{
+							MaxBudget:      &memberBudget,
+							BudgetDuration: &memberDuration,
+							BudgetResetAt:  &resetAt,
+						},
 					},
 				},
 			}
@@ -1321,24 +1323,33 @@ func TestGetKeyInfoMergesTeamBudget(t *testing.T) {
 		t.Fatalf("getKeyInfo() error = %v", err)
 	}
 	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 65.0 {
-		t.Errorf("expected TeamMaxBudget=65.0, got %v", info.TeamMaxBudget)
+		t.Errorf("expected TeamMaxBudget=65.0 from membership, got %v", info.TeamMaxBudget)
 	}
-	if info.TeamSpend == nil || *info.TeamSpend != 4.0 {
-		t.Errorf("expected TeamSpend=4.0 (key spend), got %v", info.TeamSpend)
+	if info.TeamSpend == nil || *info.TeamSpend != memberSpend {
+		t.Errorf("expected TeamSpend=%v (membership spend), got %v", memberSpend, info.TeamSpend)
+	}
+	if info.TeamBudgetResetAt == nil || *info.TeamBudgetResetAt != resetAt {
+		t.Errorf("expected TeamBudgetResetAt=%q, got %v", resetAt, info.TeamBudgetResetAt)
 	}
 
-	// formatStatusLine should show member budget, not raw spend
+	// Display shows the membership budget; the key's $16.54 spend never appears.
 	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
 	result := formatStatusLine(info, "", StatusInput{})
 	if !strings.Contains(result, "$4.00/$65.00") {
 		t.Errorf("expected $4.00/$65.00 in output, got %q", result)
 	}
+	if strings.Contains(result, "16.54") {
+		t.Errorf("key spend must not appear, got %q", result)
+	}
 }
 
-func TestGetKeyInfoFallsBackToKeySpendWhenNoMembership(t *testing.T) {
+// TestGetKeyInfoIgnoresKeySpendWhenNoMembership: when the caller's membership isn't
+// found, fall back to the team-level budget table paired with the team total spend —
+// never the key's own spend.
+func TestGetKeyInfoIgnoresKeySpendWhenNoMembership(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	keySpend := 1.33
+	keySpend := 1.33 // must never be displayed
 	memberBudget := 65.0
 	memberDuration := "7d"
 	resetAt := "2026-04-13T00:00:00Z"
@@ -1388,14 +1399,20 @@ func TestGetKeyInfoFallsBackToKeySpendWhenNoMembership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getKeyInfo() error = %v", err)
 	}
-	if info.TeamSpend == nil || *info.TeamSpend != keySpend {
-		t.Errorf("expected TeamSpend=%v (key spend fallback), got %v", keySpend, info.TeamSpend)
+	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != memberBudget {
+		t.Errorf("expected TeamMaxBudget=%v from team-level table, got %v", memberBudget, info.TeamMaxBudget)
+	}
+	if info.TeamSpend == nil || *info.TeamSpend != otherSpend {
+		t.Errorf("expected TeamSpend=%v (team total), got %v", otherSpend, info.TeamSpend)
 	}
 
 	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
 	result := formatStatusLine(info, "", StatusInput{})
-	if !strings.Contains(result, "$1.33/$65.00") {
-		t.Errorf("expected $1.33/$65.00 in output, got %q", result)
+	if !strings.Contains(result, "$12.80/$65.00") {
+		t.Errorf("expected $12.80/$65.00 in output, got %q", result)
+	}
+	if strings.Contains(result, "1.33") {
+		t.Errorf("key spend must not appear, got %q", result)
 	}
 }
 
@@ -1461,16 +1478,15 @@ func TestZeroBudgetDivision(t *testing.T) {
 	zeroBudget := 0.0
 
 	info := &KeyInfo{
-		Spend:     &spend,
-		MaxBudget: &zeroBudget,
+		TeamSpend:     &spend,
+		TeamMaxBudget: &zeroBudget,
 	}
 
-	// Should not panic on zero budget
+	// Should not panic on zero budget; a zero team budget reads as "no budget".
 	result := formatStatusLine(info, "", StatusInput{})
 
-	// With zero budget, it should show just the spend (like no budget)
-	if !strings.Contains(result, "$10.00") {
-		t.Errorf("expected result to contain spend, got %q", result)
+	if !strings.Contains(result, "no budget configured") {
+		t.Errorf("expected no-budget message for zero budget, got %q", result)
 	}
 }
 
@@ -1482,7 +1498,7 @@ func TestFormatStatusLineWithModelAndContext(t *testing.T) {
 
 	spend := 25.0
 	budget := 100.0
-	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+	info := &KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget}
 
 	pct := 78.0
 	in := StatusInput{}
@@ -1513,5 +1529,140 @@ func TestFormatStatusLineWithModelAndContext(t *testing.T) {
 	}
 	if !strings.Contains(result, "consider /compact") {
 		t.Errorf("expected /compact suggestion at 78%%, got %q", result)
+	}
+}
+
+// TestCacheKeyNamespacing verifies the budget cache is keyed by base URL + token, so
+// switching keys/projects never surfaces another config's budget (M1).
+func TestCacheKeyNamespacing(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	spend := 42.0
+	budget := 100.0
+	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+
+	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
+	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
+	writeBudgetCache(info)
+	if _, ok := readBudgetCache(); !ok {
+		t.Fatal("expected cache hit for original key+URL")
+	}
+
+	// Different token → must miss.
+	t.Setenv("LITELLM_PROXY_API_KEY", "key-b")
+	if _, ok := readBudgetCache(); ok {
+		t.Error("expected cache miss after switching token")
+	}
+
+	// Different base URL → must miss.
+	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
+	t.Setenv("LITELLM_PROXY_URL", "https://b.example")
+	if _, ok := readBudgetCache(); ok {
+		t.Error("expected cache miss after switching base URL")
+	}
+
+	// Back to the original pair → still cached.
+	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
+	if _, ok := readBudgetCache(); !ok {
+		t.Error("expected cache hit after returning to original key+URL")
+	}
+}
+
+// TestWriteBudgetCacheConcurrent verifies concurrent writers never leave a torn file
+// thanks to atomic write-then-rename (H2). Run with -race for the strongest signal.
+func TestWriteBudgetCacheConcurrent(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("LITELLM_PROXY_URL", "https://concurrent.example")
+	t.Setenv("LITELLM_PROXY_API_KEY", "key-c")
+
+	spend := 42.0
+	budget := 100.0
+	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 25; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			writeBudgetCache(info)
+		}()
+	}
+	wg.Wait()
+
+	got, ok := readBudgetCache()
+	if !ok {
+		t.Fatal("expected a valid (non-torn) cache after concurrent writes")
+	}
+	if got.Spend == nil || *got.Spend != 42.0 {
+		t.Errorf("cache corrupted by concurrent writes: %+v", got)
+	}
+}
+
+// TestGetKeyInfoNegativeCache verifies a failed fetch is negative-cached so the next
+// refresh within the window does not re-hit the network (H1).
+func TestGetKeyInfoNegativeCache(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	if _, err := getKeyInfo("test-token"); err == nil {
+		t.Fatal("expected error on first call")
+	}
+	if _, err := getKeyInfo("test-token"); err == nil {
+		t.Fatal("expected error on second call")
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 API call (negative cache suppresses the retry), got %d", callCount)
+	}
+}
+
+// TestGetKeyInfoNegativeCachePreservesAuthError verifies the replayed error still
+// satisfies errors.Is(ErrAuth) after being reconstructed from the negative cache (H1).
+func TestGetKeyInfoNegativeCachePreservesAuthError(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	_, err1 := getKeyInfo("bad-token")
+	if !errors.Is(err1, ErrAuth) {
+		t.Fatalf("expected ErrAuth on first call, got %v", err1)
+	}
+	_, err2 := getKeyInfo("bad-token")
+	if !errors.Is(err2, ErrAuth) {
+		t.Errorf("expected ErrAuth replayed from negative cache, got %v", err2)
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 API call (auth failure negative-cached), got %d", callCount)
+	}
+}
+
+// TestUpdateCacheNegativeBackoff verifies an empty (failed/rate-limited) update check
+// is still cached so the next refresh backs off instead of re-calling GitHub (H1).
+func TestUpdateCacheNegativeBackoff(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	writeUpdateCache("")
+	v, ok := readUpdateCache()
+	if !ok {
+		t.Fatal("expected empty update result to be cached for backoff")
+	}
+	if v != "" {
+		t.Errorf("expected empty cached version, got %q", v)
 	}
 }
