@@ -37,6 +37,16 @@ jobs:
       - name: mise install
         uses: jdx/mise-action@v2
 
+      - name: Stamp version from tag
+        run: |
+          # Tag is "0.4.0" — vsce wants "0.4.0", not "v0.4.0"
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.release.tag_name }}}"
+          VERSION="${VERSION#v}"
+          echo "Version: $VERSION"
+          # Patch package.json in place
+          jq --arg v "$VERSION" '.version = $v' vscode-extension/package.json > /tmp/pkg.json
+          mv /tmp/pkg.json vscode-extension/package.json
+
       - name: Build VS Code extension
         working-directory: vscode-extension
         run: |
@@ -47,7 +57,7 @@ jobs:
       - name: Upload VS Code extension to release
         uses: softprops/action-gh-release@v2
         with:
-          files: vscode-extension/claude-code-litellm-0.0.0-dev.vsix
+          files: vscode-extension/claude-code-litellm-*.vsix
 
   intellij:
     runs-on: ubuntu-latest
@@ -58,6 +68,14 @@ jobs:
       - name: mise install
         uses: jdx/mise-action@v2
 
+      - name: Stamp version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.release.tag_name }}}"
+          VERSION="${VERSION#v}"
+          echo "Version: $VERSION"
+          # Patch build.gradle.kts version in place
+          sed -i "s/version = \"0.0.0-dev\"/version = \"$VERSION\"/" intellij-plugin/build.gradle.kts
+
       - name: Build IntelliJ plugin
         working-directory: intellij-plugin
         run: ./gradlew buildPlugin --console=plain
@@ -65,4 +83,4 @@ jobs:
       - name: Upload IntelliJ plugin to release
         uses: softprops/action-gh-release@v2
         with:
-          files: intellij-plugin/build/distributions/claude-code-litellm-intellij-0.0.0-dev.zip
+          files: intellij-plugin/build/distributions/claude-code-litellm-intellij-*.zip

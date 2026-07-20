@@ -31,7 +31,7 @@ run = "npm install && npm run compile && npm run package"
 [tasks."vscode:install"]
 description = "Install the built VS Code extension (.vsix) into code"
 depends = ["vscode:build"]
-run = "code --install-extension vscode-extension/claude-code-litellm-0.0.0-dev.vsix --force"
+run = "code --install-extension vscode-extension/claude-code-litellm-*.vsix --force"
 
 # --- IntelliJ ----------------------------------------------------------------
 
@@ -43,7 +43,7 @@ run = "./gradlew buildPlugin --console=plain"
 [tasks."intellij:install"]
 description = "Install the built IntelliJ plugin zip (open the file picker in IntelliJ)"
 depends = ["intellij:build"]
-run = "open intellij-plugin/build/distributions/claude-code-litellm-intellij-0.0.0-dev.zip"
+run = "open intellij-plugin/build/distributions/claude-code-litellm-intellij-*.zip"
 
 [tasks.fmt]
 description = "Format Go source files"
