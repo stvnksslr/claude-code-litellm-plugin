@@ -32,31 +32,11 @@
           "default": "",
           "markdownDescription": "Path to the `claude-code-litellm-plugin` binary. If empty, the extension resolves it from `PATH`, then falls back to common install locations (`~/.local/bin`, `/usr/local/bin`)."
         },
-        "claudeCodeLitellm.proxyUrl": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "LiteLLM proxy URL. If set, overrides the `LITELLM_PROXY_URL` / `ANTHROPIC_BASE_URL` environment variables when spawning the binary."
-        },
-        "claudeCodeLitellm.apiKey": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "LiteLLM API key. If set, overrides the `LITELLM_PROXY_API_KEY` / `ANTHROPIC_AUTH_TOKEN` environment variables when spawning the binary."
-        },
         "claudeCodeLitellm.refreshSeconds": {
           "type": "number",
           "default": 30,
           "minimum": 5,
           "markdownDescription": "Seconds between status bar refreshes. Minimum 5."
-        },
-        "claudeCodeLitellm.showCost": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Show dollar amounts ($spend/$budget) in the status bar instead of just the percentage."
-        },
-        "claudeCodeLitellm.prefix": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Custom status bar prefix. If empty, the binary derives one from the Claude Code model name (or `LiteLLM:`)."
         }
       }
     }

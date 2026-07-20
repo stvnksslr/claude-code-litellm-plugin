@@ -505,33 +505,6 @@ func TestGetEnvWithFallback(t *testing.T) {
 	}
 }
 
-func TestIsDebug(t *testing.T) {
-	t.Run("enabled with 1", func(t *testing.T) {
-		t.Setenv("LITELLM_DEBUG", "1")
-		if !isDebug() {
-			t.Error("expected isDebug() = true when LITELLM_DEBUG=1")
-		}
-	})
-	t.Run("enabled with true", func(t *testing.T) {
-		t.Setenv("LITELLM_DEBUG", "true")
-		if !isDebug() {
-			t.Error("expected isDebug() = true when LITELLM_DEBUG=true")
-		}
-	})
-	t.Run("disabled when unset", func(t *testing.T) {
-		t.Setenv("LITELLM_DEBUG", "")
-		if isDebug() {
-			t.Error("expected isDebug() = false when LITELLM_DEBUG is empty")
-		}
-	})
-	t.Run("disabled with 0", func(t *testing.T) {
-		t.Setenv("LITELLM_DEBUG", "0")
-		if isDebug() {
-			t.Error("expected isDebug() = false when LITELLM_DEBUG=0")
-		}
-	})
-}
-
 func TestReadStatusInput(t *testing.T) {
 	t.Run("valid JSON with model and context", func(t *testing.T) {
 		in := strings.NewReader(`{"model":{"display_name":"Opus 4.7","id":"claude-opus-4-7"},"context_window":{"used_percentage":78.5}}`)
@@ -1818,30 +1791,180 @@ func TestBuildStatusJSON(t *testing.T) {
 			t.Errorf("expected Prefix=Opus 4.7:, got %q", out.Prefix)
 		}
 	})
-
-	// Parity: the JSON text field must equal the ANSI-stripped terminal output.
-	// This is the guard that prevents the --json and stdout paths from drifting.
-	t.Run("text field matches stripped ANSI output", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_PREFIX", "")
-		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
-
-		resetAt := time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339)
-		dur := "7d"
-		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &dur}
-		out := buildStatusJSON(info, "", StatusInput{}, nil)
-		want := stripANSI(formatStatusLine(info, "", StatusInput{}))
-		if out.Text != want {
-			t.Errorf("text field drift:\n  got:  %q\n  want: %q", out.Text, want)
-		}
-	})
 }
 
 func TestBuildStatusJSONNoAPIKey(t *testing.T) {
-	// Exercises the no-API-key path in main via buildStatusJSON directly.
-	// "no api key" is not auth/budget/connection, so it falls into the generic bucket.
+	// Exercises the no-API-key path: ErrNoAPIKey must classify as "no api key",
+	// and the text field must render "No API key" (not generic "Error").
 	t.Setenv("LITELLM_PLUGIN_PREFIX", "")
-	out := buildStatusJSON(nil, "", StatusInput{}, fmt.Errorf("no api key"))
-	if out.Error != "error" {
-		t.Errorf("expected generic 'error' classification for 'no api key', got %q", out.Error)
+	out := buildStatusJSON(nil, "", StatusInput{}, fmt.Errorf("%w", ErrNoAPIKey))
+	if out.Error != "no api key" {
+		t.Errorf("expected 'no api key' classification, got %q", out.Error)
+	}
+	if !strings.Contains(out.Text, "No API key") {
+		t.Errorf("expected text to contain 'No API key', got %q", out.Text)
+	}
+}
+
+// TestOutputModeParity asserts that the --json text field and the stdout terminal
+// output render the same content (modulo ANSI color codes) across every render
+// state. This is the guard that prevents the two output modes from drifting.
+func TestOutputModeParity(t *testing.T) {
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+
+	spend0 := 0.0
+	spend20 := 20.0
+	spend48 := 48.0
+	spend75 := 75.0
+	spend95 := 95.0
+	budget50 := 50.0
+	budget100 := 100.0
+	resetAt := time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339)
+	weekly := "7d"
+
+	ctxPct := 45.0
+	ctxInput := StatusInput{}
+	ctxInput.ContextWindow = &struct {
+		UsedPercentage *float64 `json:"used_percentage"`
+	}{UsedPercentage: &ctxPct}
+
+	modelInput := StatusInput{}
+	modelInput.Model.DisplayName = "Opus 4.7"
+
+	cases := []struct {
+		name          string
+		info          *KeyInfo
+		latestVersion string
+		input         StatusInput
+		err           error
+		showCost      bool
+	}{
+		{
+			name:  "normal budget green",
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget50, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: StatusInput{},
+		},
+		{
+			name:  "normal budget with model prefix",
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget50, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: modelInput,
+		},
+		{
+			name:  "empty budget zero percent",
+			info:  &KeyInfo{TeamSpend: &spend0, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: StatusInput{},
+		},
+		{
+			name:  "warn budget yellow",
+			info:  &KeyInfo{TeamSpend: &spend75, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: StatusInput{},
+		},
+		{
+			name:  "critical budget red",
+			info:  &KeyInfo{TeamSpend: &spend95, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: StatusInput{},
+		},
+		{
+			name:  "full budget",
+			info:  &KeyInfo{TeamSpend: &spend48, TeamMaxBudget: &budget50, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: StatusInput{},
+		},
+		{
+			name:  "with context segment",
+			info:  &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input: ctxInput,
+		},
+		{
+			name:     "with show cost enabled",
+			info:     &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget50, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			input:    StatusInput{},
+			showCost: true,
+		},
+		{
+			name:          "with update available",
+			info:          &KeyInfo{TeamSpend: &spend20, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &weekly},
+			latestVersion: "v99.0.0",
+			input:         StatusInput{},
+		},
+		{
+			name:  "budget exceeded with details",
+			info:  nil,
+			input: StatusInput{},
+			err:   &BudgetExceededError{Spend: 55, MaxBudget: 50},
+		},
+		{
+			name:  "budget exceeded no details",
+			info:  nil,
+			input: StatusInput{},
+			err:   ErrBudgetExceeded,
+		},
+		{
+			name:  "auth error",
+			info:  nil,
+			input: StatusInput{},
+			err:   fmt.Errorf("status=401: %w", ErrAuth),
+		},
+		{
+			name:  "connection error",
+			info:  nil,
+			input: StatusInput{},
+			err:   fmt.Errorf("dial tcp: connection refused"),
+		},
+		{
+			name:  "timeout error",
+			info:  nil,
+			input: StatusInput{},
+			err:   fmt.Errorf("context deadline exceeded (timeout)"),
+		},
+		{
+			name:  "generic error",
+			info:  nil,
+			input: StatusInput{},
+			err:   fmt.Errorf("unexpected internal error"),
+		},
+		{
+			name:  "nil info nil error",
+			info:  nil,
+			input: StatusInput{},
+			err:   nil,
+		},
+		{
+			name:  "no budget configured",
+			info:  &KeyInfo{Spend: &spend20},
+			input: StatusInput{},
+		},
+		{
+			name:  "no api key",
+			info:  nil,
+			input: StatusInput{},
+			err:   fmt.Errorf("%w", ErrNoAPIKey),
+		},
+	}
+
+	origVersion := Version
+	defer func() { Version = origVersion }()
+	Version = "v1.0.0"
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.showCost {
+				t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+			} else {
+				t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+			}
+
+			// JSON path: buildStatusJSON renders the text field via stripANSI(renderLine(...)).
+			jsonOut := buildStatusJSON(tc.info, tc.latestVersion, tc.input, tc.err)
+
+			// Terminal path: main() prints renderLine(...) with ANSI color.
+			terminalOut := renderLine(tc.info, tc.latestVersion, tc.input, tc.err)
+
+			// Parity: JSON text must equal the terminal output with ANSI stripped.
+			stripped := stripANSI(terminalOut)
+			if jsonOut.Text != stripped {
+				t.Errorf("output drift between --json and stdout:\n  json text:  %q\n  stripped:   %q", jsonOut.Text, stripped)
+			}
+		})
 	}
 }

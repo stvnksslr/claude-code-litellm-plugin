@@ -42,6 +42,9 @@ const (
 // ErrAuth is returned when the API responds with a 401 or 403 status.
 var ErrAuth = errors.New("auth error")
 
+// ErrNoAPIKey is returned when neither LITELLM_PROXY_API_KEY nor ANTHROPIC_AUTH_TOKEN is set.
+var ErrNoAPIKey = errors.New("no api key")
+
 // ErrBudgetExceeded is returned when the API reports the key's budget has been exceeded.
 var ErrBudgetExceeded = errors.New("budget exceeded")
 
@@ -481,12 +484,6 @@ func getBaseURL() string {
 // getToken returns the API token from environment
 func getToken() string {
 	return getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-}
-
-// isDebug returns true if debug mode is enabled via LITELLM_DEBUG environment variable
-func isDebug() bool {
-	val := os.Getenv("LITELLM_DEBUG")
-	return val == "1" || val == "true"
 }
 
 // isShowCostEnabled returns true only when LITELLM_PLUGIN_SHOW_COST is explicitly enabled.
@@ -958,34 +955,37 @@ func stripANSI(s string) string {
 	return s
 }
 
-// renderText produces the fully-rendered status line with ANSI stripped, for the
-// --json Text field. Editors forward this directly instead of re-implementing
-// the format. Mirrors formatStatusLine / formatError exactly.
-func renderText(info *KeyInfo, latestVersion string, input StatusInput, err error) string {
+// renderLine produces the fully-rendered status line (with ANSI color) for the
+// current state. Both the stdout path (main) and the --json Text field use this,
+// so the two output modes can never drift. buildStatusJSON strips the ANSI for JSON.
+func renderLine(info *KeyInfo, latestVersion string, input StatusInput, err error) string {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrBudgetExceeded):
 			var bErr *BudgetExceededError
 			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
 				pct := (bErr.Spend / bErr.MaxBudget) * 100
-				return stripANSI(fmt.Sprintf("%s$%.2f/$%.2f (%.0f%%) | Budget exceeded",
-					getPrefix(input), bErr.Spend, bErr.MaxBudget, pct))
+				return fmt.Sprintf("%s%s$%.2f/$%.2f (%.0f%%) | Budget exceeded%s",
+					ColorRed, getPrefix(input), bErr.Spend, bErr.MaxBudget, pct, ColorReset)
 			}
-			return stripANSI(formatError("Budget exceeded", input))
+			return formatError("Budget exceeded", input)
 		case errors.Is(err, ErrAuth):
-			return stripANSI(formatError("Auth error", input))
+			return formatError("Auth error", input)
 		case strings.Contains(err.Error(), "timeout") ||
 			strings.Contains(err.Error(), "connection") ||
 			strings.Contains(err.Error(), "dial"):
-			return stripANSI(formatError("Connection error", input))
+			return formatError("Connection error", input)
 		default:
-			return stripANSI(formatError("Error", input))
+			if errors.Is(err, ErrNoAPIKey) {
+				return formatError("No API key", input)
+			}
+			return formatError("Error", input)
 		}
 	}
 	if info == nil {
-		return stripANSI(formatError("Error", input))
+		return formatError("Error", input)
 	}
-	return stripANSI(formatStatusLine(info, latestVersion, input))
+	return formatStatusLine(info, latestVersion, input)
 }
 
 // buildStatusJSON gathers the same data as the ANSI path but returns a structured
@@ -993,7 +993,7 @@ func renderText(info *KeyInfo, latestVersion string, input StatusInput, err erro
 // decides whether to render the ANSI line or emit this struct.
 func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err error) StatusJSON {
 	out := StatusJSON{Prefix: strings.TrimSpace(getPrefix(input))}
-	out.Text = renderText(info, latestVersion, input, err)
+	out.Text = stripANSI(renderLine(info, latestVersion, input, err))
 
 	if input.ContextWindow != nil && input.ContextWindow.UsedPercentage != nil {
 		pct := *input.ContextWindow.UsedPercentage
@@ -1023,6 +1023,8 @@ func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err
 			out.Error = "budget exceeded"
 		case errors.Is(err, ErrAuth):
 			out.Error = "auth error"
+		case errors.Is(err, ErrNoAPIKey):
+			out.Error = "no api key"
 		case strings.Contains(err.Error(), "timeout") ||
 			strings.Contains(err.Error(), "connection") ||
 			strings.Contains(err.Error(), "dial"):
@@ -1072,64 +1074,29 @@ func main() {
 
 	token := getToken()
 	if token == "" {
+		noKey := fmt.Errorf("%w", ErrNoAPIKey)
 		if jsonMode {
-			emitJSON(StatusJSON{
-				Prefix: strings.TrimSpace(getPrefix(input)),
-				Error:  "no api key",
-				Text:   stripANSI(formatError("No API key", input)),
-			})
+			emitJSON(buildStatusJSON(nil, "", input, noKey))
 			return
 		}
-		fmt.Println(formatError("No API key", input))
+		fmt.Println(renderLine(nil, "", input, noKey))
 		return
 	}
 
 	info, err := getKeyInfo(token)
+	latestVersion := getLatestVersion()
 
 	if jsonMode {
-		latestVersion := getLatestVersion()
 		emitJSON(buildStatusJSON(info, latestVersion, input, err))
 		return
 	}
 
-	if err != nil {
-		debug := isDebug()
-		switch {
-		case errors.Is(err, ErrBudgetExceeded):
-			var bErr *BudgetExceededError
-			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
-				percent := (bErr.Spend / bErr.MaxBudget) * 100
-				fmt.Printf("%s%s$%.2f/$%.2f (%.0f%%) | Budget exceeded%s\n",
-					ColorRed, getPrefix(input), bErr.Spend, bErr.MaxBudget, percent, ColorReset)
-			} else {
-				fmt.Println(formatError("Budget exceeded", input))
-			}
-		case errors.Is(err, ErrAuth):
-			if debug {
-				fmt.Println(formatError("Auth error: "+err.Error(), input))
-			} else {
-				fmt.Println(formatError("Auth error", input))
-			}
-		case strings.Contains(err.Error(), "timeout") ||
-			strings.Contains(err.Error(), "connection") ||
-			strings.Contains(err.Error(), "dial"):
-			if debug {
-				fmt.Println(formatError("Connection error: "+err.Error(), input))
-			} else {
-				fmt.Println(formatError("Connection error", input))
-			}
-		default:
-			if debug {
-				fmt.Println(formatError("Error: "+err.Error(), input))
-			} else {
-				fmt.Println(formatError("Error", input))
-			}
-		}
+	if err != nil || info == nil {
+		fmt.Println(renderLine(info, latestVersion, input, err))
 		return
 	}
 
-	latestVersion := getLatestVersion()
-	fmt.Println(formatStatusLine(info, latestVersion, input))
+	fmt.Println(renderLine(info, latestVersion, input, nil))
 }
 
 // emitJSON marshals out to stdout. A failure to marshal would indicate a programming

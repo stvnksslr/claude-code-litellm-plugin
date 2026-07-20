@@ -72,27 +72,14 @@ function resolveBinary(): string {
 }
 
 /**
- * Build the env for the spawned binary. Precedence (highest wins):
- *   1. VS Code settings (explicit overrides)
- *   2. ~/.claude/settings.json `env` block (single source of truth for both surfaces)
- *   3. process.env (the extension host's environment — usually empty for GUI apps)
+ * Build the env for the spawned binary. The binary is the single source of
+ * truth — it reads LITELLM_PROXY_URL / LITELLM_PROXY_API_KEY / LITELLM_PLUGIN_*
+ * from its own env. We merge ~/.claude/settings.json `env` (where users
+ * configure these for the terminal CLI) over process.env so the extension
+ * behaves identically to the statusline.
  */
 function buildEnv(): NodeJS.ProcessEnv {
-  const cfg = vscode.workspace.getConfiguration("claudeCodeLitellm");
-  const env: NodeJS.ProcessEnv = { ...process.env, ...readClaudeSettingsEnv() };
-
-  const proxyUrl = cfg.get<string>("proxyUrl");
-  if (proxyUrl) env.LITELLM_PROXY_URL = proxyUrl;
-
-  const apiKey = cfg.get<string>("apiKey");
-  if (apiKey) env.LITELLM_PROXY_API_KEY = apiKey;
-
-  if (cfg.get<boolean>("showCost")) env.LITELLM_PLUGIN_SHOW_COST = "1";
-
-  const prefix = cfg.get<string>("prefix");
-  if (prefix) env.LITELLM_PLUGIN_PREFIX = prefix;
-
-  return env;
+  return { ...process.env, ...readClaudeSettingsEnv() };
 }
 
 /**
