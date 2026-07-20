@@ -53,11 +53,17 @@ function resolveBinary(): string {
   if (explicit) return explicit;
 
   // Fall back to common install locations so the extension works even when the
-  // binary isn't on PATH (e.g. installed via the repo's install.sh to ~/.local/bin).
-  const candidates = [
-    path.join(os.homedir(), ".local", "bin", "claude-code-litellm-plugin"),
-    "/usr/local/bin/claude-code-litellm-plugin",
-  ];
+  // binary isn't on PATH (e.g. installed via the repo's install scripts).
+  const candidates: string[] = [];
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (localAppData) {
+      candidates.push(path.join(localAppData, "Programs", "claude-code-litellm-plugin", "claude-code-litellm-plugin.exe"));
+    }
+  } else {
+    candidates.push(path.join(os.homedir(), ".local", "bin", "claude-code-litellm-plugin"));
+    candidates.push("/usr/local/bin/claude-code-litellm-plugin");
+  }
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }

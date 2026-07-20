@@ -1,7 +1,9 @@
 package com.stvnksslr.litellm
 
+import com.google.gson.Gson
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.SystemInfo
 import com.intellij.openapi.wm.StatusBar
 import com.intellij.openapi.wm.StatusBarWidget
 import com.intellij.openapi.wm.StatusBarWidgetFactory
@@ -12,10 +14,17 @@ import java.util.concurrent.TimeUnit
 // ---- Binary resolution + env (mirrors the VS Code extension) ----------------
 
 private fun resolveBinary(): String {
-    val candidates = listOf(
-        File(System.getProperty("user.home"), ".local/bin/claude-code-litellm-plugin"),
-        File("/usr/local/bin/claude-code-litellm-plugin"),
-    )
+    val candidates = if (SystemInfo.isWindows) {
+        val localAppData = System.getenv("LOCALAPPDATA")
+        if (localAppData != null) {
+            listOf(File(localAppData, "Programs/claude-code-litellm-plugin/claude-code-litellm-plugin.exe"))
+        } else emptyList()
+    } else {
+        listOf(
+            File(System.getProperty("user.home"), ".local/bin/claude-code-litellm-plugin"),
+            File("/usr/local/bin/claude-code-litellm-plugin"),
+        )
+    }
     return candidates.firstOrNull { it.exists() }?.absolutePath
         ?: "claude-code-litellm-plugin" // let PATH resolve it
 }
@@ -26,19 +35,16 @@ private fun claudeSettingsEnv(): Map<String, String> {
     val f = File(System.getProperty("user.home"), ".claude/settings.json")
     if (!f.canRead()) return emptyMap()
     return runCatching {
-        val text = f.readText()
-        // Grab the "env": { ... } object, then pull "k":"v" string pairs from it.
-        val envBlock = Regex("\"env\"\\s*:\\s*\\{([^}]*)}").find(text)?.groupValues?.get(1)
-            ?: return emptyMap()
-        Regex("\"([^\"]+)\"\\s*:\\s*\"([^\"]*)\"").findAll(envBlock)
-            .associate { it.groupValues[1] to it.groupValues[2] }
+        @Suppress("UNCHECKED_CAST")
+        val parsed = Gson().fromJson(f.readText(), Map::class.java) as Map<String, *>
+        val env = parsed["env"]
+        if (env is Map<*, *>) {
+            env.entries.mapNotNull { (k, v) ->
+                if (k is String && v is String) k to v else null
+            }.toMap()
+        } else emptyMap()
     }.getOrDefault(emptyMap())
 }
-
-// ---- Minimal flat-JSON scalar extraction ------------------------------------
-
-private fun jsonString(json: String, key: String): String? =
-    Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1)
 
 // ---- Widget -----------------------------------------------------------------
 
@@ -87,8 +93,13 @@ class LitellmWidget : StatusBarWidget, StatusBarWidget.TextPresentation {
             return "LiteLLM: timeout"
         }
         val json = out.trim()
-        return if (json.startsWith("{")) jsonString(json, "text") ?: "LiteLLM: error"
-        else "LiteLLM: error"
+        return if (json.startsWith("{")) {
+            @Suppress("UNCHECKED_CAST")
+            val parsed = Gson().fromJson(json, Map::class.java) as Map<String, *>
+            parsed["text"] as? String ?: "LiteLLM: error"
+        } else {
+            "LiteLLM: error"
+        }
     }
 }
 
