@@ -89,14 +89,16 @@ function buildEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * Map a budget percentage to a VS Code codicon that approximates the Go binary's
- * circle-gauge glyphs. VS Code has no partial-fill circle codicon, so we use
- * three states: empty, half-ish, full.
+ * Map a budget percentage to a circle-gauge glyph, matching the Go binary's
+ * five-bucket gauge: ○ ◔ ◑ ◕ ●. Plain Unicode renders fine in the VS Code
+ * status bar; codicons were hollow-only and never visually filled.
  */
 function budgetIcon(percent: number): string {
-  if (percent >= 85) return "$(circle-filled)";
-  if (percent >= 30) return "$(circle-large-outline)";
-  return "$(circle-outline)";
+  if (percent >= 85) return "●";
+  if (percent >= 60) return "◕";
+  if (percent >= 30) return "◑";
+  if (percent > 0) return "◔";
+  return "○";
 }
 
 /**
@@ -120,7 +122,7 @@ function formatText(s: StatusJSON): string {
   const prefix = s.prefix ?? "LiteLLM:";
 
   if (s.error) {
-    const icon = s.error === "budget exceeded" ? "$(circle-filled)" : "$(error)";
+    const icon = s.error === "budget exceeded" ? "●" : "⚠";
     return `${prefix} ${icon} ${s.error}`;
   }
 
