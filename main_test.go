@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1664,5 +1665,167 @@ func TestUpdateCacheNegativeBackoff(t *testing.T) {
 	}
 	if v != "" {
 		t.Errorf("expected empty cached version, got %q", v)
+	}
+}
+
+func TestBuildStatusJSON(t *testing.T) {
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+
+	spend25 := 25.0
+	spend75 := 75.0
+	spend95 := 95.0
+	budget100 := 100.0
+
+	t.Run("normal budget", func(t *testing.T) {
+		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100, TeamBudgetResetAt: strPtr("2020-01-01T00:00:00Z"), TeamBudgetDuration: strPtr("7d")}
+		out := buildStatusJSON(info, "", StatusInput{}, nil)
+		if !out.HasBudget {
+			t.Error("expected HasBudget=true")
+		}
+		if out.Percent != 25 {
+			t.Errorf("expected Percent=25, got %v", out.Percent)
+		}
+		if out.Spend != 25 {
+			t.Errorf("expected Spend=25, got %v", out.Spend)
+		}
+		if out.MaxBudget != 100 {
+			t.Errorf("expected MaxBudget=100, got %v", out.MaxBudget)
+		}
+		if out.ResetLabel != "weekly" {
+			t.Errorf("expected ResetLabel=weekly, got %q", out.ResetLabel)
+		}
+		if out.Error != "" {
+			t.Errorf("expected no error, got %q", out.Error)
+		}
+	})
+
+	t.Run("no budget configured", func(t *testing.T) {
+		info := &KeyInfo{Spend: &spend25}
+		out := buildStatusJSON(info, "", StatusInput{}, nil)
+		if out.HasBudget {
+			t.Error("expected HasBudget=false")
+		}
+		if out.Error != "no budget configured" {
+			t.Errorf("expected error, got %q", out.Error)
+		}
+	})
+
+	t.Run("budget exceeded", func(t *testing.T) {
+		err := &BudgetExceededError{Spend: 120, MaxBudget: 100}
+		out := buildStatusJSON(nil, "", StatusInput{}, err)
+		if !out.HasBudget {
+			t.Error("expected HasBudget=true for budget exceeded")
+		}
+		if out.Percent != 120 {
+			t.Errorf("expected Percent=120, got %v", out.Percent)
+		}
+		if out.Error != "budget exceeded" {
+			t.Errorf("expected 'budget exceeded', got %q", out.Error)
+		}
+	})
+
+	t.Run("auth error", func(t *testing.T) {
+		out := buildStatusJSON(nil, "", StatusInput{}, fmt.Errorf("status=401: %w", ErrAuth))
+		if out.HasBudget {
+			t.Error("expected HasBudget=false")
+		}
+		if out.Error != "auth error" {
+			t.Errorf("expected 'auth error', got %q", out.Error)
+		}
+	})
+
+	t.Run("connection error", func(t *testing.T) {
+		out := buildStatusJSON(nil, "", StatusInput{}, fmt.Errorf("dial tcp: connection refused"))
+		if out.Error != "connection error" {
+			t.Errorf("expected 'connection error', got %q", out.Error)
+		}
+	})
+
+	t.Run("update available", func(t *testing.T) {
+		origVersion := Version
+		defer func() { Version = origVersion }()
+		Version = "v1.0.0"
+
+		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100}
+		out := buildStatusJSON(info, "v1.1.0", StatusInput{}, nil)
+		if out.UpdateAvailable != "v1.1.0" {
+			t.Errorf("expected UpdateAvailable=v1.1.0, got %q", out.UpdateAvailable)
+		}
+	})
+
+	t.Run("context percent present", func(t *testing.T) {
+		pct := 78.0
+		input := StatusInput{}
+		input.ContextWindow = &struct {
+			UsedPercentage *float64 `json:"used_percentage"`
+		}{UsedPercentage: &pct}
+		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100}
+		out := buildStatusJSON(info, "", input, nil)
+		if !out.HasContext {
+			t.Error("expected HasContext=true")
+		}
+		if out.ContextPercent != 78 {
+			t.Errorf("expected ContextPercent=78, got %v", out.ContextPercent)
+		}
+	})
+
+	t.Run("context clamped above 100", func(t *testing.T) {
+		pct := 150.0
+		input := StatusInput{}
+		input.ContextWindow = &struct {
+			UsedPercentage *float64 `json:"used_percentage"`
+		}{UsedPercentage: &pct}
+		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100}
+		out := buildStatusJSON(info, "", input, nil)
+		if out.ContextPercent != 100 {
+			t.Errorf("expected clamped to 100, got %v", out.ContextPercent)
+		}
+	})
+
+	t.Run("nil info with nil error", func(t *testing.T) {
+		out := buildStatusJSON(nil, "", StatusInput{}, nil)
+		if out.Error != "error" {
+			t.Errorf("expected generic error, got %q", out.Error)
+		}
+	})
+
+	t.Run("95% near full budget", func(t *testing.T) {
+		info := &KeyInfo{TeamSpend: &spend95, TeamMaxBudget: &budget100}
+		out := buildStatusJSON(info, "", StatusInput{}, nil)
+		if out.Percent != 95 {
+			t.Errorf("expected Percent=95, got %v", out.Percent)
+		}
+	})
+
+	t.Run("75% warn budget", func(t *testing.T) {
+		info := &KeyInfo{TeamSpend: &spend75, TeamMaxBudget: &budget100}
+		out := buildStatusJSON(info, "", StatusInput{}, nil)
+		if out.Percent != 75 {
+			t.Errorf("expected Percent=75, got %v", out.Percent)
+		}
+	})
+
+	t.Run("prefix from model name", func(t *testing.T) {
+		if err := os.Unsetenv("LITELLM_PLUGIN_PREFIX"); err != nil {
+			t.Fatal(err)
+		}
+		input := StatusInput{}
+		input.Model.DisplayName = "Opus 4.7"
+		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100}
+		out := buildStatusJSON(info, "", input, nil)
+		if out.Prefix != "Opus 4.7:" {
+			t.Errorf("expected Prefix=Opus 4.7:, got %q", out.Prefix)
+		}
+	})
+}
+
+func TestBuildStatusJSONNoAPIKey(t *testing.T) {
+	// Exercises the no-API-key path in main via buildStatusJSON directly.
+	// "no api key" is not auth/budget/connection, so it falls into the generic bucket.
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+	out := buildStatusJSON(nil, "", StatusInput{}, fmt.Errorf("no api key"))
+	if out.Error != "error" {
+		t.Errorf("expected generic 'error' classification for 'no api key', got %q", out.Error)
 	}
 }

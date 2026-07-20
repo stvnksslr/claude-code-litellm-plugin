@@ -1,0 +1,17 @@
+<idea-plugin>
+    <id>com.stvnksslr.claude-code-litellm</id>
+    <name>Claude Code LiteLLM</name>
+    <vendor>stvnksslr</vendor>
+    <description><![CDATA[
+        Shows LiteLLM budget usage in the IDE status bar, mirroring the Claude Code
+        statusline plugin. Spawns the claude-code-litellm-plugin binary with --json.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <statusBarWidgetFactory
+            id="ClaudeCodeLitellm"
+            implementation="com.stvnksslr.litellm.LitellmWidgetFactory"/>
+    </extensions>
+</idea-plugin>

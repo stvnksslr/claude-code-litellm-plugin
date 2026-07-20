@@ -928,21 +928,122 @@ func formatError(msg string, input StatusInput) string {
 	return fmt.Sprintf("%s%s%s%s", ColorRed, getPrefix(input), msg, ColorReset)
 }
 
+// StatusJSON is the structured output emitted with --json, consumed by the VS Code
+// extension (and any other caller that prefers data over ANSI text). All fields are
+// optional — absent values are omitted so a minimal payload stays minimal.
+type StatusJSON struct {
+	Prefix          string  `json:"prefix,omitempty"`
+	Percent         float64 `json:"percent"`
+	Spend           float64 `json:"spend,omitempty"`
+	MaxBudget       float64 `json:"max_budget,omitempty"`
+	HasBudget       bool    `json:"has_budget"`
+	ResetLabel      string  `json:"reset_label,omitempty"`
+	ResetTime       string  `json:"reset_time,omitempty"`
+	UpdateAvailable string  `json:"update_available,omitempty"`
+	ContextPercent  float64 `json:"context_percent,omitempty"`
+	HasContext      bool    `json:"has_context"`
+	Error           string  `json:"error,omitempty"`
+}
+
+// buildStatusJSON gathers the same data as the ANSI path but returns a structured
+// StatusJSON. info may be nil (fetch failed); err carries the reason. The caller
+// decides whether to render the ANSI line or emit this struct.
+func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err error) StatusJSON {
+	out := StatusJSON{Prefix: strings.TrimSpace(getPrefix(input))}
+
+	if input.ContextWindow != nil && input.ContextWindow.UsedPercentage != nil {
+		pct := *input.ContextWindow.UsedPercentage
+		if pct < 0 {
+			pct = 0
+		} else if pct > 100 {
+			pct = 100
+		}
+		out.HasContext = true
+		out.ContextPercent = pct
+	}
+
+	if isUpdateAvailable(Version, latestVersion) {
+		out.UpdateAvailable = latestVersion
+	}
+
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrBudgetExceeded):
+			var bErr *BudgetExceededError
+			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
+				out.HasBudget = true
+				out.Spend = bErr.Spend
+				out.MaxBudget = bErr.MaxBudget
+				out.Percent = (bErr.Spend / bErr.MaxBudget) * 100
+			}
+			out.Error = "budget exceeded"
+		case errors.Is(err, ErrAuth):
+			out.Error = "auth error"
+		case strings.Contains(err.Error(), "timeout") ||
+			strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "dial"):
+			out.Error = "connection error"
+		default:
+			out.Error = "error"
+		}
+		return out
+	}
+
+	if info == nil {
+		out.Error = "error"
+		return out
+	}
+
+	info = resolveEffectiveBudget(info)
+	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
+		out.Error = "no budget configured"
+		return out
+	}
+
+	out.HasBudget = true
+	out.MaxBudget = *info.MaxBudget
+	if info.Spend != nil {
+		out.Spend = *info.Spend
+	}
+	out.Percent = (out.Spend / out.MaxBudget) * 100
+
+	resetTime, durationLabel := formatTimeUntilReset(info.BudgetResetAt, info.BudgetDuration)
+	out.ResetTime = resetTime
+	out.ResetLabel = durationLabel
+
+	return out
+}
+
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+	args := os.Args[1:]
+
+	if len(args) > 0 && (args[0] == "--version" || args[0] == "-v") {
 		fmt.Println(Version)
 		return
 	}
+
+	jsonMode := len(args) > 0 && args[0] == "--json"
 
 	input := readStatusInput(os.Stdin)
 
 	token := getToken()
 	if token == "" {
+		if jsonMode {
+			emitJSON(StatusJSON{Prefix: strings.TrimSpace(getPrefix(input)), Error: "no api key"})
+			return
+		}
 		fmt.Println(formatError("No API key", input))
 		return
 	}
 
 	info, err := getKeyInfo(token)
+
+	if jsonMode {
+		latestVersion := getLatestVersion()
+		emitJSON(buildStatusJSON(info, latestVersion, input, err))
+		return
+	}
+
 	if err != nil {
 		debug := isDebug()
 		switch {
@@ -981,4 +1082,15 @@ func main() {
 
 	latestVersion := getLatestVersion()
 	fmt.Println(formatStatusLine(info, latestVersion, input))
+}
+
+// emitJSON marshals out to stdout. A failure to marshal would indicate a programming
+// error (nil pointers on the struct fields can't happen), so it panics — the binary
+// should never produce unparseable JSON in --json mode.
+func emitJSON(out StatusJSON) {
+	data, err := json.Marshal(out)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(data))
 }

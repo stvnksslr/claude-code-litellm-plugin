@@ -1,9 +1,49 @@
 [tools]
 go = "1.26.1"
+node = "22"       # VS Code extension: npm/tsc/vsce
+java = "21"      # IntelliJ plugin: runs Gradle 8.13 wrapper + Kotlin 1.9.25
 
 [tasks.build]
-description = "Build for the current platform"
+description = "Build the statusline binary for the current platform"
 run = "go build -o claude-code-litellm-plugin ."
+
+[tasks.install]
+description = "Install the statusline binary via install.sh (downloads latest release + configures Claude)"
+run = "bash install.sh"
+
+# --- All plugins --------------------------------------------------------------
+
+[tasks."build:all"]
+description = "Build the statusline binary and both editor plugins"
+depends = ["build", "vscode:build", "intellij:build"]
+
+[tasks."install:all"]
+description = "Install the statusline binary and both editor plugins"
+depends = ["install", "vscode:install", "intellij:install"]
+
+# --- VS Code ------------------------------------------------------------------
+
+[tasks."vscode:build"]
+description = "Compile TypeScript and package the VS Code extension into a .vsix"
+dir = "{{config_root}}/vscode-extension"
+run = "npm install && npm run compile && npm run package"
+
+[tasks."vscode:install"]
+description = "Install the built VS Code extension (.vsix) into code"
+depends = ["vscode:build"]
+run = "code --install-extension vscode-extension/claude-code-litellm-0.0.0-dev.vsix --force"
+
+# --- IntelliJ ----------------------------------------------------------------
+
+[tasks."intellij:build"]
+description = "Build the IntelliJ plugin zip via the Gradle wrapper"
+dir = "{{config_root}}/intellij-plugin"
+run = "./gradlew buildPlugin --console=plain"
+
+[tasks."intellij:install"]
+description = "Install the built IntelliJ plugin zip (open the file picker in IntelliJ)"
+depends = ["intellij:build"]
+run = "open intellij-plugin/build/distributions/claude-code-litellm-intellij-0.0.0-dev.zip"
 
 [tasks.fmt]
 description = "Format Go source files"

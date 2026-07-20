@@ -46,6 +46,40 @@ chmod +x ~/.local/bin/claude-code-litellm-plugin
 }
 ```
 
+## Editor Plugins
+
+Optional status bar widgets for VS Code and IntelliJ — they spawn the same
+`claude-code-litellm-plugin` binary (with `--json`) and render the budget info
+in the editor's status bar. The binary must already be installed and on `PATH`
+(or at `~/.local/bin/claude-code-litellm-plugin`).
+
+### VS Code
+
+Download the latest `claude-code-litellm-*.vsix` from the
+[releases page](https://github.com/stvnksslr/claude-code-litellm-plugin/releases),
+then:
+
+```bash
+code --install-extension path/to/claude-code-litellm-*.vsix --force
+```
+
+Reload the window (`Cmd/Ctrl+Shift+P` → “Developer: Reload Window”).
+
+### IntelliJ
+
+Download the latest `claude-code-litellm-intellij-*.zip` from the
+[releases page](https://github.com/stvnksslr/claude-code-litellm-plugin/releases),
+then:
+
+`Settings` → `Plugins` → ⚙ → `Install Plugin from Disk…` → select the zip → restart.
+
+### Marketplace publishing
+
+> **TODO:** Both editor plugins are built locally and attached to GitHub
+> releases for now. They are not yet published to their respective marketplaces
+> (VS Code Marketplace, JetBrains Marketplace). Publishing will be added once
+> the plugins are stabilized and the publisher accounts are provisioned.
+
 ## Configuration
 
 ### Environment Variables
@@ -139,13 +173,26 @@ If the statusline shows an error:
 
 ## Development
 
-Run tests:
+This repo uses [mise](https://mise.jdx.dev) to manage the Go, Node, and Java
+toolchains (see `mise.toml`). After cloning:
 
 ```bash
-go test -v
+mise install   # installs go, node, java
 ```
 
-Run locally:
+Common tasks:
+
+```bash
+mise run build            # statusline binary
+mise run vscode:build     # VS Code .vsix
+mise run intellij:build   # IntelliJ .zip
+mise run build:all        # all three
+
+mise run test             # Go tests (regenerates examples.svg)
+mise run lint             # go fmt + tidy + golangci-lint
+```
+
+Run the statusline locally:
 
 ```bash
 go run main.go

@@ -42,3 +42,32 @@ jobs:
 
       - name: go test
         run: go test -v ./...
+
+  vscode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: mise install
+        uses: jdx/mise-action@v2
+
+      - name: Install and build VS Code extension
+        working-directory: vscode-extension
+        run: |
+          npm ci
+          npm run compile
+          npm run package
+
+  intellij:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: mise install
+        uses: jdx/mise-action@v2
+
+      - name: Build IntelliJ plugin
+        working-directory: intellij-plugin
+        run: ./gradlew buildPlugin --console=plain

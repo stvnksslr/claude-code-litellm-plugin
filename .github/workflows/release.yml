@@ -16,10 +16,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - name: mise install
+        uses: jdx/mise-action@v2
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
@@ -29,3 +27,42 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  vscode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: mise install
+        uses: jdx/mise-action@v2
+
+      - name: Build VS Code extension
+        working-directory: vscode-extension
+        run: |
+          npm ci
+          npm run compile
+          npm run package
+
+      - name: Upload VS Code extension to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vscode-extension/claude-code-litellm-0.0.0-dev.vsix
+
+  intellij:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: mise install
+        uses: jdx/mise-action@v2
+
+      - name: Build IntelliJ plugin
+        working-directory: intellij-plugin
+        run: ./gradlew buildPlugin --console=plain
+
+      - name: Upload IntelliJ plugin to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: intellij-plugin/build/distributions/claude-code-litellm-intellij-0.0.0-dev.zip
