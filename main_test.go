@@ -1818,6 +1818,22 @@ func TestBuildStatusJSON(t *testing.T) {
 			t.Errorf("expected Prefix=Opus 4.7:, got %q", out.Prefix)
 		}
 	})
+
+	// Parity: the JSON text field must equal the ANSI-stripped terminal output.
+	// This is the guard that prevents the --json and stdout paths from drifting.
+	t.Run("text field matches stripped ANSI output", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_PREFIX", "")
+		t.Setenv("LITELLM_PLUGIN_SHOW_COST", "")
+
+		resetAt := time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339)
+		dur := "7d"
+		info := &KeyInfo{TeamSpend: &spend25, TeamMaxBudget: &budget100, TeamBudgetResetAt: &resetAt, TeamBudgetDuration: &dur}
+		out := buildStatusJSON(info, "", StatusInput{}, nil)
+		want := stripANSI(formatStatusLine(info, "", StatusInput{}))
+		if out.Text != want {
+			t.Errorf("text field drift:\n  got:  %q\n  want: %q", out.Text, want)
+		}
+	})
 }
 
 func TestBuildStatusJSONNoAPIKey(t *testing.T) {

@@ -931,8 +931,13 @@ func formatError(msg string, input StatusInput) string {
 // StatusJSON is the structured output emitted with --json, consumed by the VS Code
 // extension (and any other caller that prefers data over ANSI text). All fields are
 // optional — absent values are omitted so a minimal payload stays minimal.
+//
+// Text is the fully-rendered status line (ANSI stripped) — editors forward it
+// directly instead of re-implementing the format. Percent is kept alongside so
+// editors can apply their own background-color theming (which can't be forwarded).
 type StatusJSON struct {
 	Prefix          string  `json:"prefix,omitempty"`
+	Text            string  `json:"text"`
 	Percent         float64 `json:"percent"`
 	Spend           float64 `json:"spend,omitempty"`
 	MaxBudget       float64 `json:"max_budget,omitempty"`
@@ -945,11 +950,50 @@ type StatusJSON struct {
 	Error           string  `json:"error,omitempty"`
 }
 
+// stripANSI removes all ANSI escape sequences from s, leaving plain text.
+func stripANSI(s string) string {
+	for _, c := range []string{ColorRed, ColorYellow, ColorGreen, ColorGray, ColorReset} {
+		s = strings.ReplaceAll(s, c, "")
+	}
+	return s
+}
+
+// renderText produces the fully-rendered status line with ANSI stripped, for the
+// --json Text field. Editors forward this directly instead of re-implementing
+// the format. Mirrors formatStatusLine / formatError exactly.
+func renderText(info *KeyInfo, latestVersion string, input StatusInput, err error) string {
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrBudgetExceeded):
+			var bErr *BudgetExceededError
+			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
+				pct := (bErr.Spend / bErr.MaxBudget) * 100
+				return stripANSI(fmt.Sprintf("%s$%.2f/$%.2f (%.0f%%) | Budget exceeded",
+					getPrefix(input), bErr.Spend, bErr.MaxBudget, pct))
+			}
+			return stripANSI(formatError("Budget exceeded", input))
+		case errors.Is(err, ErrAuth):
+			return stripANSI(formatError("Auth error", input))
+		case strings.Contains(err.Error(), "timeout") ||
+			strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "dial"):
+			return stripANSI(formatError("Connection error", input))
+		default:
+			return stripANSI(formatError("Error", input))
+		}
+	}
+	if info == nil {
+		return stripANSI(formatError("Error", input))
+	}
+	return stripANSI(formatStatusLine(info, latestVersion, input))
+}
+
 // buildStatusJSON gathers the same data as the ANSI path but returns a structured
 // StatusJSON. info may be nil (fetch failed); err carries the reason. The caller
 // decides whether to render the ANSI line or emit this struct.
 func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err error) StatusJSON {
 	out := StatusJSON{Prefix: strings.TrimSpace(getPrefix(input))}
+	out.Text = renderText(info, latestVersion, input, err)
 
 	if input.ContextWindow != nil && input.ContextWindow.UsedPercentage != nil {
 		pct := *input.ContextWindow.UsedPercentage
@@ -1029,7 +1073,11 @@ func main() {
 	token := getToken()
 	if token == "" {
 		if jsonMode {
-			emitJSON(StatusJSON{Prefix: strings.TrimSpace(getPrefix(input)), Error: "no api key"})
+			emitJSON(StatusJSON{
+				Prefix: strings.TrimSpace(getPrefix(input)),
+				Error:  "no api key",
+				Text:   stripANSI(formatError("No API key", input)),
+			})
 			return
 		}
 		fmt.Println(formatError("No API key", input))

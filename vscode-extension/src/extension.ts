@@ -7,6 +7,7 @@ import * as fs from "fs";
 /** Fields emitted by `claude-code-litellm-plugin --json`. All optional. */
 interface StatusJSON {
   prefix?: string;
+  text?: string;
   percent?: number;
   spend?: number;
   max_budget?: number;
@@ -89,19 +90,6 @@ function buildEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * Map a budget percentage to a circle-gauge glyph, matching the Go binary's
- * five-bucket gauge: ○ ◔ ◑ ◕ ●. Plain Unicode renders fine in the VS Code
- * status bar; codicons were hollow-only and never visually filled.
- */
-function budgetIcon(percent: number): string {
-  if (percent >= 85) return "●";
-  if (percent >= 60) return "◕";
-  if (percent >= 30) return "◑";
-  if (percent > 0) return "◔";
-  return "○";
-}
-
-/**
  * Pick the statusbar background color. VS Code only allows two themed backgrounds
  * (error + warning) — we use red for ≥90%, yellow for 75–89%, and default (no
  * background) below that.
@@ -114,35 +102,6 @@ function backgroundColor(
   if (percent >= 90) return new vscode.ThemeColor("statusBarItem.errorBackground");
   if (percent >= 75) return new vscode.ThemeColor("statusBarItem.warningBackground");
   return undefined;
-}
-
-/** Format the status bar text from the parsed JSON. */
-function formatText(s: StatusJSON): string {
-  // s.prefix already carries its own trailing colon (e.g. "LiteLLM:"), so never append another.
-  const prefix = s.prefix ?? "LiteLLM:";
-
-  if (s.error) {
-    const icon = s.error === "budget exceeded" ? "●" : "⚠";
-    return `${prefix} ${icon} ${s.error}`;
-  }
-
-  // Mirror the Go statusline: "<prefix> <glyph> <pct>% <reset> | 📖 <ctx>%".
-  let text = `${prefix} ${budgetIcon(s.percent ?? 0)} ${Math.round(s.percent ?? 0)}%`;
-
-  if (s.reset_time) {
-    const label = s.reset_label ? `${s.reset_label} ` : "";
-    text += ` ${label}reset: ${s.reset_time}`;
-  }
-
-  if (s.has_context && s.context_percent != null) {
-    text += ` | 📖 ${Math.round(s.context_percent)}%`;
-  }
-
-  if (s.update_available) {
-    text += ` | update: ${s.update_available}`;
-  }
-
-  return text;
 }
 
 /** Build the hover tooltip (plain text, no ANSI). */
@@ -217,7 +176,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       } catch {
         parsed = { error: "error" };
       }
-      item.text = formatText(parsed);
+      item.text = parsed.text || "LiteLLM: error";
       item.tooltip = formatTooltip(parsed);
       item.backgroundColor = backgroundColor(parsed.percent ?? 0, parsed.has_budget ?? false);
       item.show();

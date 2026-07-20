@@ -40,43 +40,6 @@ private fun claudeSettingsEnv(): Map<String, String> {
 private fun jsonString(json: String, key: String): String? =
     Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1)
 
-private fun jsonNumber(json: String, key: String): Double? =
-    Regex("\"$key\"\\s*:\\s*(-?[0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
-
-private fun jsonBool(json: String, key: String): Boolean =
-    Regex("\"$key\"\\s*:\\s*(true|false)").find(json)?.groupValues?.get(1) == "true"
-
-// Five-bucket circle gauge, matching the Go statusline glyphs.
-private fun circleGlyph(percent: Double): String = when {
-    percent >= 87.5 -> "●"
-    percent >= 62.5 -> "◕"
-    percent >= 37.5 -> "◑"
-    percent >= 12.5 -> "◔"
-    else -> "○"
-}
-
-// Build status bar text mirroring formatText() in the VS Code extension.
-private fun formatText(json: String): String {
-    val prefix = jsonString(json, "prefix") ?: "LiteLLM:"
-    jsonString(json, "error")?.let { err ->
-        val icon = if (err == "budget exceeded") "●" else "⚠"
-        return "$prefix $icon $err"
-    }
-
-    val percent = jsonNumber(json, "percent") ?: 0.0
-    val sb = StringBuilder("$prefix ${circleGlyph(percent)} ${Math.round(percent)}%")
-
-    jsonString(json, "reset_time")?.let { reset ->
-        val label = jsonString(json, "reset_label")?.let { "$it " } ?: ""
-        sb.append(" ${label}reset: $reset")
-    }
-    if (jsonBool(json, "has_context")) {
-        jsonNumber(json, "context_percent")?.let { sb.append(" | \uD83D\uDCD6 ${Math.round(it)}%") }
-    }
-    jsonString(json, "update_available")?.let { sb.append(" | update: $it") }
-    return sb.toString()
-}
-
 // ---- Widget -----------------------------------------------------------------
 
 private const val WIDGET_ID = "ClaudeCodeLitellm"
@@ -124,7 +87,8 @@ class LitellmWidget : StatusBarWidget, StatusBarWidget.TextPresentation {
             return "LiteLLM: timeout"
         }
         val json = out.trim()
-        return if (json.startsWith("{")) formatText(json) else "LiteLLM: error"
+        return if (json.startsWith("{")) jsonString(json, "text") ?: "LiteLLM: error"
+        else "LiteLLM: error"
     }
 }
 
