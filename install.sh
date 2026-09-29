@@ -161,8 +161,15 @@ main() {
     if [ -z "${ANTHROPIC_BASE_URL:-}" ] && [ -z "${LITELLM_PROXY_URL:-}" ]; then
         missing_vars+=("ANTHROPIC_BASE_URL or LITELLM_PROXY_URL")
     fi
-    if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${LITELLM_PROXY_API_KEY:-}" ] && [ ! -f "${HOME}/.claude/.credentials.json" ]; then
-        missing_vars+=("ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY (or log in via SSO so ~/.claude/.credentials.json exists)")
+    have_claude_credentials=false
+    if [ -f "${HOME}/.claude/.credentials.json" ]; then
+        have_claude_credentials=true
+    elif [ "$(uname)" = "Darwin" ] && security find-generic-password -a "${USER:-$(id -un)}" -s "Claude Code-credentials" >/dev/null 2>&1; then
+        # Claude Code stores SSO credentials in the login Keychain on macOS.
+        have_claude_credentials=true
+    fi
+    if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${LITELLM_PROXY_API_KEY:-}" ] && [ "$have_claude_credentials" = false ]; then
+        missing_vars+=("ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY (or sign in to Claude Code via SSO so ~/.claude/.credentials.json or the macOS Keychain has a credential)")
     fi
 
     if [ ${#missing_vars[@]} -gt 0 ]; then

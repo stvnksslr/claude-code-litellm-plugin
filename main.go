@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -212,18 +216,30 @@ func cacheDir() string {
 // cache files don't bleed across different proxies/keys (e.g. per-project configs
 // that point at different LiteLLM instances or use different keys).
 func cacheKey() string {
-	sum := sha256.Sum256([]byte(getBaseURL() + "\x00" + getToken()))
+	return cacheKeyFor(getToken())
+}
+
+// cacheKeyFor hashes the base URL with the token actually in flight — not a
+// re-resolution of the ambient env/keychain state, which can change between
+// token resolution and cache access.
+func cacheKeyFor(apiKey string) string {
+	sum := sha256.Sum256([]byte(getBaseURL() + "\x00" + apiKey))
 	return hex.EncodeToString(sum[:])[:12]
 }
 
 func budgetCacheFile() string {
-	return filepath.Join(cacheDir(), "budget-"+cacheKey()+".json")
+	return budgetCacheFileFor(getToken())
 }
 
-// budgetFailCacheFile holds the negative-cache marker for failed budget fetches.
-// Namespaced per-key so a failure for one key doesn't suppress fetches for another.
-func budgetFailCacheFile() string {
-	return filepath.Join(cacheDir(), "budget-fail-"+cacheKey()+".json")
+func budgetCacheFileFor(apiKey string) string {
+	return filepath.Join(cacheDir(), "budget-"+cacheKeyFor(apiKey)+".json")
+}
+
+// budgetFailCacheFileFor holds the negative-cache marker for failed budget
+// fetches, namespaced per-key so a failure for one key doesn't suppress
+// fetches for another.
+func budgetFailCacheFileFor(apiKey string) string {
+	return filepath.Join(cacheDir(), "budget-fail-"+cacheKeyFor(apiKey)+".json")
 }
 
 // updateCacheFile is intentionally NOT namespaced by key: the latest GitHub release
@@ -266,8 +282,8 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 
 // readBudgetCache reads cached budget info from disk.
 // Returns nil, false if the cache is missing, corrupt, or older than CacheTTLMs.
-func readBudgetCache() (*KeyInfo, bool) {
-	data, err := os.ReadFile(budgetCacheFile())
+func readBudgetCache(apiKey string) (*KeyInfo, bool) {
+	data, err := os.ReadFile(budgetCacheFileFor(apiKey))
 	if err != nil {
 		return nil, false
 	}
@@ -283,7 +299,7 @@ func readBudgetCache() (*KeyInfo, bool) {
 
 // writeBudgetCache writes budget info to the filesystem cache.
 // Errors are silently ignored — caching is best-effort.
-func writeBudgetCache(info *KeyInfo) {
+func writeBudgetCache(apiKey string, info *KeyInfo) {
 	if info == nil {
 		return
 	}
@@ -298,13 +314,13 @@ func writeBudgetCache(info *KeyInfo) {
 	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
 		return
 	}
-	_ = writeFileAtomic(budgetCacheFile(), data, 0o600)
+	_ = writeFileAtomic(budgetCacheFileFor(apiKey), data, 0o600)
 }
 
 // readBudgetFailCache returns a recent failed-fetch record, if one exists within
 // BudgetFailTTLMs. Returns nil, false when absent, corrupt, or expired.
-func readBudgetFailCache() (*BudgetFailEntry, bool) {
-	data, err := os.ReadFile(budgetFailCacheFile())
+func readBudgetFailCache(apiKey string) (*BudgetFailEntry, bool) {
+	data, err := os.ReadFile(budgetFailCacheFileFor(apiKey))
 	if err != nil {
 		return nil, false
 	}
@@ -320,7 +336,10 @@ func readBudgetFailCache() (*BudgetFailEntry, bool) {
 
 // writeBudgetFailCache records a failed budget fetch so subsequent refreshes back off
 // instead of re-blocking on the network. Errors are silently ignored — best-effort.
-func writeBudgetFailCache(fetchErr error) {
+func writeBudgetFailCache(apiKey string, fetchErr error) {
+	if apiKey == "" {
+		return
+	}
 	entry := BudgetFailEntry{
 		Timestamp: time.Now().UnixMilli(),
 		Message:   fetchErr.Error(),
@@ -342,7 +361,7 @@ func writeBudgetFailCache(fetchErr error) {
 	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
 		return
 	}
-	_ = writeFileAtomic(budgetFailCacheFile(), data, 0o600)
+	_ = writeFileAtomic(budgetFailCacheFileFor(apiKey), data, 0o600)
 }
 
 // errorFromFailEntry rebuilds an error equivalent to the original failed fetch so
@@ -485,18 +504,99 @@ func getBaseURL() string {
 // getToken returns the gateway auth token. Precedence:
 //  1. LITELLM_PROXY_API_KEY env var
 //  2. ANTHROPIC_AUTH_TOKEN env var
-//  3. Claude Code's OAuth access token from its credentials file (SSO logins)
+//  3. Claude Code's credential store — the LiteLLM gateway SSO token
+//     (enterpriseGateway.jwt) when present, else the Anthropic OAuth access
+//     token (claudeAiOauth.accessToken)
 //
 // API-key mode is unchanged — env vars win exactly as before; the credential
-// file is only consulted when neither env var is set.
+// store is only consulted when neither env var is set.
 func getToken() string {
-	if tok := getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN"); tok != "" {
-		return tok
-	}
-	return claudeOAuthToken()
+	tok, _ := resolveToken()
+	return tok
 }
 
-// credentialsFilePath returns the path to Claude Code's OAuth credentials file.
+// resolveToken returns the auth token plus whether it is a LiteLLM gateway SSO
+// token (enterpriseGateway.jwt). Gateway tokens authenticate but are not DB
+// key rows, so callers must use /user/info instead of /key/info for budgets.
+func resolveToken() (string, bool) {
+	if tok := getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN"); tok != "" {
+		return tok, false
+	}
+	for _, payload := range credentialStorePayloads() {
+		if gw := extractGatewayToken(payload); gw != "" {
+			return gw, true
+		}
+	}
+	for _, payload := range credentialStorePayloads() {
+		if tok := extractAIOAuthToken(payload); tok != "" {
+			return tok, false
+		}
+	}
+	return "", false
+}
+
+// extractGatewayToken returns the LiteLLM gateway SSO token (enterpriseGateway.jwt)
+// from a credential-store payload, skipping expired entries. The store shape is
+// {"enterpriseGateway":{"jwt":"…","url":…,"expiresAt":1790782037250},…} with
+// expiresAt in epoch milliseconds. Returns "" when absent, expired, or unparsable.
+func extractGatewayToken(payload []byte) string {
+	var creds struct {
+		EnterpriseGateway *struct {
+			JWT       string   `json:"jwt"`
+			ExpiresAt *float64 `json:"expiresAt"`
+		} `json:"enterpriseGateway"`
+	}
+	if err := json.Unmarshal(payload, &creds); err != nil || creds.EnterpriseGateway == nil {
+		return ""
+	}
+	if creds.EnterpriseGateway.JWT == "" {
+		return ""
+	}
+	if expired(creds.EnterpriseGateway.ExpiresAt) {
+		return ""
+	}
+	return creds.EnterpriseGateway.JWT
+}
+
+// extractAIOAuthToken returns the Anthropic OAuth access token from a
+// credential-store payload ({"claudeAiOauth":{"accessToken":…}}), skipping
+// expired entries. expiresAt is epoch milliseconds in Claude Code's Keychain
+// payload and an RFC3339 string in some file payloads — both are accepted.
+func extractAIOAuthToken(payload []byte) string {
+	var creds struct {
+		ClaudeAiOauth *struct {
+			AccessToken string          `json:"accessToken"`
+			ExpiresAt   json.RawMessage `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(payload, &creds); err != nil || creds.ClaudeAiOauth == nil {
+		return ""
+	}
+	if creds.ClaudeAiOauth.AccessToken == "" {
+		return ""
+	}
+	var ms *float64
+	var raw any
+	if err := json.Unmarshal(creds.ClaudeAiOauth.ExpiresAt, &ms); err == nil && ms != nil {
+		if expired(ms) {
+			return ""
+		}
+	} else if err := json.Unmarshal(creds.ClaudeAiOauth.ExpiresAt, &raw); err == nil {
+		if s, ok := raw.(string); ok && s != "" {
+			if t, err := time.Parse(time.RFC3339, s); err == nil && time.Now().After(t) {
+				return ""
+			}
+		}
+	}
+	return creds.ClaudeAiOauth.AccessToken
+}
+
+// expired reports whether an epoch-milliseconds timestamp has passed. A nil
+// timestamp (unknown expiry) is treated as still valid.
+func expired(ms *float64) bool {
+	return ms != nil && time.Now().After(time.UnixMilli(int64(*ms)))
+}
+
 // LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE overrides the default location for
 // non-standard installs and tests. Returns "" when no path can be determined.
 func credentialsFilePath() string {
@@ -517,23 +617,103 @@ func credentialsFilePath() string {
 // the caller falls through to the normal no-token error path. The local read is cheap
 // and fail-fast (matching the 3s HTTP budget); the token is never logged.
 func claudeOAuthToken() string {
-	path := credentialsFilePath()
-	if path == "" {
-		return ""
+	for _, payload := range credentialStorePayloads() {
+		if tok := extractAIOAuthToken(payload); tok != "" {
+			return tok
+		}
 	}
-	data, err := os.ReadFile(path)
+	return ""
+}
+
+// credentialStorePayloads returns Claude Code credential-store JSON payloads to
+// scan for tokens, most-specific first:
+//  1. the credentials file (LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE override or
+//     ~/.claude/.credentials.json) — when the override is set it is the only
+//     source, keeping tests and non-standard installs deterministic
+//  2. on macOS, the login Keychain item Claude Code maintains (service
+//     "Claude Code-credentials"). Claude Code stores credentials only in the
+//     Keychain on macOS, so gateway-SSO users have no credentials file.
+func credentialStorePayloads() [][]byte {
+	var payloads [][]byte
+	if path := credentialsFilePath(); path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			payloads = append(payloads, data)
+		}
+		if os.Getenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE") != "" {
+			return payloads
+		}
+	}
+	payloads = append(payloads, keychainCredentialPayloads()...)
+	return payloads
+}
+
+// keychainRead reads the accountless Keychain lookup — the same query Claude
+// Code's own reader falls back to. Swapped out in tests. Returns nil when
+// nothing usable is found.
+var keychainRead = func() []byte {
+	return runSecurity("find-generic-password", "-s", "Claude Code-credentials", "-w")
+}
+
+func keychainCredentialPayloads() [][]byte {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var payloads [][]byte
+	for _, data := range [][]byte{keychainReadWithAccount(), keychainRead()} {
+		if len(data) == 0 {
+			continue
+		}
+		key := string(data)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		payloads = append(payloads, data)
+	}
+	return payloads
+}
+
+// keychainReadWithAccount queries the Keychain item anchored to the current
+// user's account attribute — Claude Code writes one credential item per
+// account, and the accountless lookup can return a stale item from an older
+// login. Falls back to the accountless lookup via keychainRead.
+var keychainReadWithAccount = func() []byte {
+	name := keychainAccountName()
+	if name == "" {
+		return nil
+	}
+	return runSecurity("find-generic-password", "-a", name, "-s", "Claude Code-credentials", "-w")
+}
+
+// keychainAccountName resolves the account attribute Claude Code uses for its
+// Keychain item (observed: the local username).
+func keychainAccountName() string {
+	if name := os.Getenv("USER"); name != "" {
+		return name
+	}
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return ""
+}
+
+// runSecurity shells out to /usr/bin/security, the only supported way to read
+// the login Keychain from a non-entitled process. The read is fail-fast (1s
+// budget — a locked Keychain would otherwise block on an unlock prompt) and
+// the token is never logged.
+func runSecurity(args ...string) []byte {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "security", args...).Output()
 	if err != nil {
-		return ""
+		return nil
 	}
-	var creds struct {
-		ClaudeAiOauth struct {
-			AccessToken string `json:"accessToken"`
-		} `json:"claudeAiOauth"`
+	data := []byte(strings.TrimSpace(string(out)))
+	if json.Valid(data) {
+		return data
 	}
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return ""
-	}
-	return creds.ClaudeAiOauth.AccessToken
+	return nil
 }
 
 // isShowCostEnabled returns true only when LITELLM_PLUGIN_SHOW_COST is explicitly enabled.
@@ -558,69 +738,213 @@ func getPrefix(input StatusInput) string {
 	return "LiteLLM: "
 }
 
-// getKeyInfo fetches budget info from the LiteLLM API, using a 30-second filesystem cache
-// to avoid hitting the API on every statusline refresh.
-// Each invocation of this binary is a fresh process, so all state must live on disk.
-// When the key has a team_id, a second call to /team/info populates the team budget
-// fields — the only budget the statusline displays (key-level budget is ignored).
+// getKeyInfo fetches budget info for virtual API keys via /key/info, using a
+// 30-second filesystem cache to avoid hitting the API on every statusline
+// refresh. Each invocation of this binary is a fresh process, so all state
+// must live on disk. When the key has a team_id, a second call to /team/info
+// populates the team budget fields — the only budget the statusline displays
+// (key-level budget is ignored).
 func getKeyInfo(apiKey string) (*KeyInfo, error) {
-	if info, ok := readBudgetCache(); ok {
+	return budgetInfo(apiKey, false)
+}
+
+// budgetInfo is the shared cache wrapper for both budget fetch paths. Gateway
+// SSO tokens go through /user/info — they authenticate but are not DB key
+// rows, so /key/info fails on them with a "where.token" lookup error.
+func budgetInfo(apiKey string, gatewayToken bool) (*KeyInfo, error) {
+	if info, ok := readBudgetCache(apiKey); ok {
 		return info, nil
 	}
 	// Recent failure → back off and replay the cached error instead of re-blocking
 	// on the network every refresh while the proxy is down / key is bad / over budget.
-	if failed, ok := readBudgetFailCache(); ok {
+	if failed, ok := readBudgetFailCache(apiKey); ok {
 		return nil, errorFromFailEntry(failed)
 	}
-	info, err := fetchKeyInfo(apiKey)
+	var info *KeyInfo
+	var err error
+	if gatewayToken {
+		info, err = fetchUserInfo(apiKey)
+		if err == nil {
+			enrichTeamBudget(apiKey, info)
+			// Gateway tokens enforce the JWT-scoped team's budget; when that
+			// team is unbudgeted, the user-level budget is what gates requests.
+			if (info.TeamMaxBudget == nil || *info.TeamMaxBudget <= 0) && info.MaxBudget != nil {
+				info.TeamSpend = info.Spend
+				info.TeamMaxBudget = info.MaxBudget
+				info.TeamBudgetDuration = info.BudgetDuration
+				info.TeamBudgetResetAt = info.BudgetResetAt
+			}
+		}
+	} else {
+		info, err = fetchKeyInfoWithTeam(apiKey)
+	}
 	if err != nil {
-		writeBudgetFailCache(err)
+		writeBudgetFailCache(apiKey, err)
 		return nil, err
 	}
-	if info.TeamID != nil && *info.TeamID != "" {
-		if teamResp, err := fetchTeamInfo(apiKey, *info.TeamID); err == nil {
-			ti := teamResp.TeamInfo
-			// Primary source: this member's own per-member budget from team_memberships.
-			// Both the budget and its matching spend come from the same membership row;
-			// the key's own spend is never used (it tracks a different, confusing window).
-			if info.UserID != nil && *info.UserID != "" {
-				for _, m := range teamResp.TeamMemberships {
-					if m.UserID != *info.UserID {
-						continue
-					}
-					if m.LitellmBudgetTable != nil && m.LitellmBudgetTable.MaxBudget != nil {
-						info.TeamSpend = m.Spend
-						info.TeamMaxBudget = m.LitellmBudgetTable.MaxBudget
-						info.TeamBudgetDuration = m.LitellmBudgetTable.BudgetDuration
-						info.TeamBudgetResetAt = m.LitellmBudgetTable.BudgetResetAt
-					}
-					break
-				}
+	writeBudgetCache(apiKey, info)
+	return info, nil
+}
+
+// fetchKeyInfoWithTeam fetches /key/info and enriches it with the team budget
+// (the only budget the statusline displays — key-level spend is never shown).
+func fetchKeyInfoWithTeam(apiKey string) (*KeyInfo, error) {
+	info, err := fetchKeyInfo(apiKey)
+	if err != nil {
+		return nil, err
+	}
+	enrichTeamBudget(apiKey, info)
+	return info, nil
+}
+
+// enrichTeamBudget overlays the team budget onto info via /team/info — the
+// only budget the statusline displays; key/user-level spend is never shown.
+// Primary source is this member's own litellm_budget_table row; fallbacks are
+// team_member_budget_table, then the team's own max_budget. Spend is always
+// paired with the budget's own source — never the key's spend. Best-effort:
+// a failed call leaves info untouched.
+func enrichTeamBudget(apiKey string, info *KeyInfo) {
+	if info.TeamID == nil || *info.TeamID == "" {
+		return
+	}
+	teamResp, err := fetchTeamInfo(apiKey, *info.TeamID)
+	if err != nil {
+		return
+	}
+	ti := teamResp.TeamInfo
+	if info.UserID != nil && *info.UserID != "" {
+		for _, m := range teamResp.TeamMemberships {
+			if m.UserID != *info.UserID {
+				continue
 			}
-			// Fallback for instances that expose the budget at the team level instead:
-			// team_member_budget_table, else the team's own max_budget. Spend is paired
-			// with the team total — again, never the key's spend.
-			if info.TeamMaxBudget == nil {
-				switch {
-				case ti.TeamMemberBudgetTable != nil && ti.TeamMemberBudgetTable.MaxBudget != nil:
-					info.TeamMaxBudget = ti.TeamMemberBudgetTable.MaxBudget
-					info.TeamBudgetDuration = ti.TeamMemberBudgetTable.BudgetDuration
-				case ti.MaxBudget != nil:
-					info.TeamMaxBudget = ti.MaxBudget
-				}
-				if info.TeamMaxBudget != nil {
-					info.TeamSpend = ti.Spend
-					if info.TeamBudgetResetAt == nil {
-						info.TeamBudgetResetAt = ti.BudgetResetAt
-					}
-					if info.TeamBudgetDuration == nil {
-						info.TeamBudgetDuration = ti.BudgetDuration
-					}
-				}
+			if m.LitellmBudgetTable != nil && m.LitellmBudgetTable.MaxBudget != nil {
+				info.TeamSpend = m.Spend
+				info.TeamMaxBudget = m.LitellmBudgetTable.MaxBudget
+				info.TeamBudgetDuration = m.LitellmBudgetTable.BudgetDuration
+				info.TeamBudgetResetAt = m.LitellmBudgetTable.BudgetResetAt
+			}
+			break
+		}
+	}
+	if info.TeamMaxBudget == nil {
+		switch {
+		case ti.TeamMemberBudgetTable != nil && ti.TeamMemberBudgetTable.MaxBudget != nil:
+			info.TeamMaxBudget = ti.TeamMemberBudgetTable.MaxBudget
+			info.TeamBudgetDuration = ti.TeamMemberBudgetTable.BudgetDuration
+		case ti.MaxBudget != nil:
+			info.TeamMaxBudget = ti.MaxBudget
+		}
+		if info.TeamMaxBudget != nil {
+			info.TeamSpend = ti.Spend
+			if info.TeamBudgetResetAt == nil {
+				info.TeamBudgetResetAt = ti.BudgetResetAt
+			}
+			if info.TeamBudgetDuration == nil {
+				info.TeamBudgetDuration = ti.BudgetDuration
 			}
 		}
 	}
-	writeBudgetCache(info)
+}
+
+// UserInfoResponse is the /user/info response LiteLLM serves to the
+// authenticated key's user — the budget source for gateway SSO tokens.
+type UserInfoResponse struct {
+	UserID   string        `json:"user_id"`
+	UserInfo UserInfoData  `json:"user_info"`
+	Teams    []GatewayTeam `json:"teams"`
+}
+
+// UserInfoData carries the user-level budget from /user/info.
+type UserInfoData struct {
+	Spend          *float64 `json:"spend"`
+	MaxBudget      *float64 `json:"max_budget"`
+	BudgetDuration *string  `json:"budget_duration"`
+	BudgetResetAt  *string  `json:"budget_reset_at"`
+}
+
+// GatewayTeam is one entry of /user/info's teams array. A LiteLLM gateway SSO
+// token is scoped to the first team on the user record, so teams[0] is the
+// budget that applies to the token's requests.
+type GatewayTeam struct {
+	TeamID         *string  `json:"team_id"`
+	TeamAlias      *string  `json:"team_alias"`
+	Spend          *float64 `json:"spend"`
+	MaxBudget      *float64 `json:"max_budget"`
+	BudgetDuration *string  `json:"budget_duration"`
+	BudgetResetAt  *string  `json:"budget_reset_at"`
+}
+
+// fetchUserInfo fetches budget info via /user/info — the entry point that
+// works for LiteLLM gateway SSO tokens. /key/info looks the token up as a DB
+// key row and errors on gateway tokens, while /user/info resolves the
+// authenticated user and the first team on their record (the team the gateway
+// token is scoped to). Team budget detail arrives via the shared /team/info
+// enrichment; when the scoped team is unbudgeted, the caller falls back to the
+// user-level budget.
+func fetchUserInfo(apiKey string) (*KeyInfo, error) {
+	baseURL := getBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("no LiteLLM proxy URL configured (set LITELLM_PROXY_URL or ANTHROPIC_BASE_URL)")
+	}
+	endpoint := baseURL + "/user/info"
+
+	client := &http.Client{Timeout: HTTPTimeout}
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request creation failed: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("connection error: %w [url=%s]", err, endpoint)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return nil, fmt.Errorf("status=%d url=%s body=%s: %w", resp.StatusCode, endpoint, string(body), ErrAuth)
+	}
+
+	if resp.StatusCode != 200 {
+		var litellmErr liteLLMError
+		if json.Unmarshal(body, &litellmErr) == nil && litellmErr.Error.Type == "budget_exceeded" {
+			bErr := &BudgetExceededError{}
+			_, _ = fmt.Sscanf(litellmErr.Error.Message, "Budget has been exceeded! Current cost: %f, Max budget: %f", &bErr.Spend, &bErr.MaxBudget)
+			return nil, bErr
+		}
+		return nil, fmt.Errorf("HTTP error: status=%d url=%s body=%s", resp.StatusCode, endpoint, string(body))
+	}
+
+	var response UserInfoResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("JSON parse error: %w [body=%s]", err, string(body))
+	}
+
+	info := &KeyInfo{
+		Spend:          response.UserInfo.Spend,
+		MaxBudget:      response.UserInfo.MaxBudget,
+		BudgetDuration: response.UserInfo.BudgetDuration,
+		BudgetResetAt:  response.UserInfo.BudgetResetAt,
+	}
+	if response.UserID != "" {
+		id := response.UserID
+		info.UserID = &id
+	}
+	// The gateway token is scoped to the first team on the user record.
+	if len(response.Teams) > 0 {
+		t := response.Teams[0]
+		info.TeamID = t.TeamID
+		info.TeamSpend = t.Spend
+		info.TeamMaxBudget = t.MaxBudget
+		info.TeamBudgetDuration = t.BudgetDuration
+		info.TeamBudgetResetAt = t.BudgetResetAt
+	}
 	return info, nil
 }
 
@@ -1122,7 +1446,7 @@ func main() {
 
 	input := readStatusInput(os.Stdin)
 
-	token := getToken()
+	token, isGateway := resolveToken()
 	if token == "" {
 		noKey := fmt.Errorf("%w", ErrNoAPIKey)
 		if jsonMode {
@@ -1133,7 +1457,7 @@ func main() {
 		return
 	}
 
-	info, err := getKeyInfo(token)
+	info, err := budgetInfo(token, isGateway)
 	latestVersion := getLatestVersion()
 
 	if jsonMode {

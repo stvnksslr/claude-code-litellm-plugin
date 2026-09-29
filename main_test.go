@@ -1064,14 +1064,14 @@ func TestBudgetCacheReadWrite(t *testing.T) {
 	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
 
 	// Nothing in cache yet
-	_, ok := readBudgetCache()
+	_, ok := readBudgetCache("test-token")
 	if ok {
 		t.Error("expected readBudgetCache to return ok=false with empty cache")
 	}
 
 	// Write and read back
-	writeBudgetCache(info)
-	got, ok := readBudgetCache()
+	writeBudgetCache("test-token", info)
+	got, ok := readBudgetCache("test-token")
 	if !ok {
 		t.Fatal("expected readBudgetCache to return ok=true after write")
 	}
@@ -1518,27 +1518,27 @@ func TestCacheKeyNamespacing(t *testing.T) {
 
 	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
 	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
-	writeBudgetCache(info)
-	if _, ok := readBudgetCache(); !ok {
+	writeBudgetCache("key-a", info)
+	if _, ok := readBudgetCache("key-a"); !ok {
 		t.Fatal("expected cache hit for original key+URL")
 	}
 
 	// Different token → must miss.
 	t.Setenv("LITELLM_PROXY_API_KEY", "key-b")
-	if _, ok := readBudgetCache(); ok {
+	if _, ok := readBudgetCache("key-b"); ok {
 		t.Error("expected cache miss after switching token")
 	}
 
 	// Different base URL → must miss.
 	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
 	t.Setenv("LITELLM_PROXY_URL", "https://b.example")
-	if _, ok := readBudgetCache(); ok {
+	if _, ok := readBudgetCache("key-a"); ok {
 		t.Error("expected cache miss after switching base URL")
 	}
 
 	// Back to the original pair → still cached.
 	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
-	if _, ok := readBudgetCache(); !ok {
+	if _, ok := readBudgetCache("key-a"); !ok {
 		t.Error("expected cache hit after returning to original key+URL")
 	}
 }
@@ -1559,12 +1559,12 @@ func TestWriteBudgetCacheConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			writeBudgetCache(info)
+			writeBudgetCache("key-c", info)
 		}()
 	}
 	wg.Wait()
 
-	got, ok := readBudgetCache()
+	got, ok := readBudgetCache("key-c")
 	if !ok {
 		t.Fatal("expected a valid (non-torn) cache after concurrent writes")
 	}
@@ -2208,5 +2208,328 @@ func TestCacheKeyNamespacingClaudeOAuth(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_API_KEY", "")
 	if again := cacheKey(); again != oauthKey {
 		t.Errorf("cacheKey() not stable per token: %q then %q", oauthKey, again)
+	}
+}
+
+// --- Gateway SSO credential store (enterpriseGateway + Keychain) ---
+
+// stubKeychain replaces both macOS Keychain probes with canned payloads for the
+// test's lifetime, so tests never touch the real login Keychain. withAccount
+// backs the account-anchored probe (preferred), accountless the fallback probe.
+func stubKeychain(t *testing.T, withAccount, accountless []byte) {
+	t.Helper()
+	origWithAcct, origNoAcct := keychainReadWithAccount, keychainRead
+	keychainReadWithAccount = func() []byte { return withAccount }
+	keychainRead = func() []byte { return accountless }
+	t.Cleanup(func() { keychainReadWithAccount, keychainRead = origWithAcct, origNoAcct })
+}
+
+func gatewayCredsJSON(jwt string, expiresAtMs int64) string {
+	return fmt.Sprintf(`{"enterpriseGateway":{"jwt":%q,"url":"https://gw.example/claude_code_gateway","expiresAt":%d}}`, jwt, expiresAtMs)
+}
+
+func TestExtractGatewayToken(t *testing.T) {
+	future := time.Now().Add(time.Hour).UnixMilli()
+	past := time.Now().Add(-time.Hour).UnixMilli()
+
+	t.Run("valid unexpired token", func(t *testing.T) {
+		if got := extractGatewayToken([]byte(gatewayCredsJSON("gw-jwt", future))); got != "gw-jwt" {
+			t.Errorf("extractGatewayToken() = %q, want %q", got, "gw-jwt")
+		}
+	})
+
+	t.Run("expired token skipped", func(t *testing.T) {
+		if got := extractGatewayToken([]byte(gatewayCredsJSON("gw-jwt", past))); got != "" {
+			t.Errorf("extractGatewayToken() = %q, want empty for expired token", got)
+		}
+	})
+
+	t.Run("unknown expiry treated as valid", func(t *testing.T) {
+		payload := []byte(`{"enterpriseGateway":{"jwt":"gw-jwt"}}`)
+		if got := extractGatewayToken(payload); got != "gw-jwt" {
+			t.Errorf("extractGatewayToken() = %q, want %q when expiresAt absent", got, "gw-jwt")
+		}
+	})
+
+	t.Run("absent or malformed payloads", func(t *testing.T) {
+		for name, payload := range map[string][]byte{
+			"no enterpriseGateway key": []byte(`{"claudeAiOauth":{"accessToken":"x"}}`),
+			"malformed JSON":           []byte("{not json"),
+			"empty jwt":                []byte(`{"enterpriseGateway":{"jwt":""}}`),
+			"empty payload":            nil,
+		} {
+			if got := extractGatewayToken(payload); got != "" {
+				t.Errorf("%s: extractGatewayToken() = %q, want empty", name, got)
+			}
+		}
+	})
+}
+
+func TestExtractAIOAuthTokenExpiry(t *testing.T) {
+	futureMs := fmt.Sprintf("%d", time.Now().Add(time.Hour).UnixMilli())
+	pastMs := fmt.Sprintf("%d", time.Now().Add(-time.Hour).UnixMilli())
+	futureRFC := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	pastRFC := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+
+	tests := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"epoch-ms future", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%s}}`, futureMs), "tok"},
+		{"epoch-ms expired", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%s}}`, pastMs), ""},
+		{"RFC3339 future", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%q}}`, futureRFC), "tok"},
+		{"RFC3339 expired", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%q}}`, pastRFC), ""},
+		{"no expiresAt", `{"claudeAiOauth":{"accessToken":"tok"}}`, "tok"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractAIOAuthToken([]byte(tt.payload)); got != tt.want {
+				t.Errorf("extractAIOAuthToken() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveTokenGatewayPreferred pins the credential-store precedence inside
+// a single payload: the LiteLLM gateway SSO token beats the Anthropic OAuth
+// token, because only the gateway token is valid against the proxy.
+func TestResolveTokenGatewayPreferred(t *testing.T) {
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	future := time.Now().Add(time.Hour).UnixMilli()
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	payload := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-file"},"enterpriseGateway":{"jwt":"gw-jwt","expiresAt":%d}}`, future)
+	if err := os.WriteFile(p, []byte(payload), 0o600); err != nil {
+		t.Fatalf("failed to write credentials file: %v", err)
+	}
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+
+	tok, isGateway := resolveToken()
+	if tok != "gw-jwt" || !isGateway {
+		t.Errorf("resolveToken() = (%q, %v), want (gw-jwt, true)", tok, isGateway)
+	}
+}
+
+// TestResolveTokenKeychainFallback covers the macOS path where no credentials
+// file exists — Claude Code keeps gateway credentials only in the Keychain.
+// The account-anchored probe is preferred; a stale accountless item must not
+// win once a fresh one is found.
+func TestResolveTokenKeychainFallback(t *testing.T) {
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("HOME", t.TempDir()) // default credentials file absent
+	future := time.Now().Add(time.Hour).UnixMilli()
+	past := time.Now().Add(-24 * time.Hour).UnixMilli()
+
+	t.Run("fresh gateway token from account-anchored item", func(t *testing.T) {
+		stubKeychain(t,
+			[]byte(gatewayCredsJSON("gw-jwt", future)),                                                         // -a <user> probe
+			[]byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-stale","expiresAt":%d}}`, past)), // -s probe
+		)
+		tok, isGateway := resolveToken()
+		if tok != "gw-jwt" || !isGateway {
+			t.Errorf("resolveToken() = (%q, %v), want (gw-jwt, true)", tok, isGateway)
+		}
+	})
+
+	t.Run("claudeAiOauth fallback when no gateway token", func(t *testing.T) {
+		stubKeychain(t,
+			[]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-keychain"}}`),
+			nil,
+		)
+		tok, isGateway := resolveToken()
+		if tok != "sk-ant-oat01-keychain" || isGateway {
+			t.Errorf("resolveToken() = (%q, %v), want (sk-ant-oat01-keychain, false)", tok, isGateway)
+		}
+	})
+
+	t.Run("empty keychain yields no token", func(t *testing.T) {
+		stubKeychain(t, nil, nil)
+		if tok, _ := resolveToken(); tok != "" {
+			t.Errorf("resolveToken() = %q, want empty", tok)
+		}
+	})
+
+	t.Run("env key still wins over keychain", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_API_KEY", "env-key")
+		stubKeychain(t, []byte(gatewayCredsJSON("gw-jwt", future)), nil)
+		tok, isGateway := resolveToken()
+		if tok != "env-key" || isGateway {
+			t.Errorf("resolveToken() = (%q, %v), want (env-key, false)", tok, isGateway)
+		}
+	})
+}
+
+// --- /user/info budget path (gateway SSO tokens) ---
+
+// userInfoServer spins up an httptest server serving a /user/info fixture and
+// pins LITELLM_PROXY_URL at it, with the cache isolated to a temp dir.
+func userInfoServer(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Setenv("LITELLM_PROXY_URL", server.URL)
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestFetchUserInfo(t *testing.T) {
+	t.Run("team budget preferred over user fields", func(t *testing.T) {
+		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100,"budget_duration":"1d","budget_reset_at":"2026-10-01T00:00:00Z"},"teams":[{"team_id":"team-1","team_alias":"Platform","spend":80.25,"max_budget":500,"budget_duration":"1mo","budget_reset_at":"2026-10-31T00:00:00Z"}]}`)
+		info, err := fetchUserInfo("gw-jwt")
+		if err != nil {
+			t.Fatalf("fetchUserInfo() error = %v", err)
+		}
+		if info.Spend == nil || *info.Spend != 12.5 || info.MaxBudget == nil || *info.MaxBudget != 100 {
+			t.Errorf("user fields not mapped: %+v", info)
+		}
+		if info.TeamID == nil || *info.TeamID != "team-1" {
+			t.Errorf("TeamID = %v, want team-1", info.TeamID)
+		}
+		if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 500 || info.TeamSpend == nil || *info.TeamSpend != 80.25 {
+			t.Errorf("team budget fields not mapped: %+v", info)
+		}
+		if info.TeamBudgetDuration == nil || *info.TeamBudgetDuration != "1mo" {
+			t.Errorf("TeamBudgetDuration = %v, want 1mo", info.TeamBudgetDuration)
+		}
+	})
+
+	t.Run("user budget used when scoped team has none", func(t *testing.T) {
+		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","spend":80.25,"max_budget":null}]}`)
+		info, err := fetchUserInfo("gw-jwt")
+		if err != nil {
+			t.Fatalf("fetchUserInfo() error = %v", err)
+		}
+		if info.TeamID == nil || *info.TeamID != "team-1" {
+			t.Errorf("TeamID = %v, want team-1 (the JWT-scoped team)", info.TeamID)
+		}
+		if info.MaxBudget == nil || *info.MaxBudget != 100 {
+			t.Errorf("user budget not mapped: %+v", info)
+		}
+	})
+
+	t.Run("401 maps to ErrAuth", func(t *testing.T) {
+		userInfoServer(t, 401, `{"error":"unauthorized"}`)
+		_, err := fetchUserInfo("expired-token")
+		if !errors.Is(err, ErrAuth) {
+			t.Errorf("fetchUserInfo() error = %v, want ErrAuth", err)
+		}
+	})
+
+	t.Run("non-200 surfaces HTTP error", func(t *testing.T) {
+		userInfoServer(t, 500, `{"error":{"message":"boom"}}`)
+		_, err := fetchUserInfo("gw-jwt")
+		if err == nil || !strings.Contains(err.Error(), "HTTP error: status=500") {
+			t.Errorf("fetchUserInfo() error = %v, want HTTP error: status=500", err)
+		}
+	})
+}
+
+// TestBudgetInfoGatewayTeamEnrichment proves the gateway path mirrors the
+// virtual-key flow: /user/info supplies the JWT-scoped team id, then
+// /team/info supplies the real budget (team_member_budget_table — the field
+// /user/info's team entries do not carry). When the scoped team is unbudgeted
+// entirely, the user-level budget is what gates requests and is displayed.
+func TestBudgetInfoGatewayTeamEnrichment(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","team_alias":"PB IT SG","spend":0,"max_budget":null}]}`))
+	})
+	mux.HandleFunc("/team/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"team_info":{"spend":7.25,"max_budget":null,"team_member_budget_table":{"max_budget":65,"budget_duration":"7d","budget_reset_at":"2026-10-05T00:00:00Z"}}}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", server.URL)
+
+	info, err := budgetInfo("gw-jwt", true)
+	if err != nil {
+		t.Fatalf("budgetInfo(gateway) error = %v", err)
+	}
+	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 65 {
+		t.Errorf("TeamMaxBudget = %v, want 65 from team_member_budget_table", info.TeamMaxBudget)
+	}
+	if info.TeamSpend == nil || *info.TeamSpend != 7.25 {
+		t.Errorf("TeamSpend = %v, want 7.25 (team total, paired with its budget)", info.TeamSpend)
+	}
+	if info.TeamBudgetDuration == nil || *info.TeamBudgetDuration != "7d" {
+		t.Errorf("TeamBudgetDuration = %v, want 7d", info.TeamBudgetDuration)
+	}
+
+	// Scoped team fully unbudgeted → the user-level budget is displayed.
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	mux2 := http.NewServeMux()
+	mux2.HandleFunc("/user/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100,"budget_duration":"1mo"},"teams":[{"team_id":"team-2","spend":0,"max_budget":null}]}`))
+	})
+	mux2.HandleFunc("/team/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"team_info":{"spend":0,"max_budget":null}}`))
+	})
+	server2 := httptest.NewServer(mux2)
+	defer server2.Close()
+	t.Setenv("LITELLM_PROXY_URL", server2.URL)
+
+	info, err = budgetInfo("gw-jwt", true)
+	if err != nil {
+		t.Fatalf("budgetInfo(gateway, unbudgeted team) error = %v", err)
+	}
+	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 100 || info.TeamSpend == nil || *info.TeamSpend != 12.5 {
+		t.Errorf("user budget not promoted when team unbudgeted: %+v", info)
+	}
+	if info.TeamBudgetDuration == nil || *info.TeamBudgetDuration != "1mo" {
+		t.Errorf("TeamBudgetDuration = %v, want 1mo (user budget's duration)", info.TeamBudgetDuration)
+	}
+}
+
+// TestBudgetInfoGatewayRouting proves gateway tokens are served by /user/info
+// while virtual keys still go through /key/info — the two endpoints disagree
+// about gateway tokens (the key endpoint fails on them with a where-token
+// lookup error).
+func TestBudgetInfoGatewayRouting(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	var keyInfoHits, userInfoHits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/key/info":
+			keyInfoHits++
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"where.token: A value is required but not set"}}`))
+		case "/user/info":
+			userInfoHits++
+			_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"spend":1,"max_budget":10},"teams":[]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", server.URL)
+
+	if _, err := budgetInfo("gw-jwt", true); err != nil {
+		t.Fatalf("budgetInfo(gateway) error = %v", err)
+	}
+	if keyInfoHits != 0 || userInfoHits != 1 {
+		t.Errorf("gateway token hit /key/info=%d /user/info=%d, want 0/1", keyInfoHits, userInfoHits)
+	}
+
+	keyInfoHits, userInfoHits = 0, 0
+	// /key/info needs a parseable KeyInfoResponse body; serve a minimal one.
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/key/info" {
+			keyInfoHits++
+			_, _ = w.Write([]byte(`{"info":{"spend":2,"max_budget":20}}`))
+			return
+		}
+		w.WriteHeader(404)
+	})
+	if _, err := budgetInfo("sk-key", false); err != nil {
+		t.Fatalf("budgetInfo(virtual key) error = %v", err)
+	}
+	if keyInfoHits != 1 || userInfoHits != 0 {
+		t.Errorf("virtual key hit /key/info=%d /user/info=%d, want 1/0", keyInfoHits, userInfoHits)
 	}
 }
