@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -686,7 +687,7 @@ func TestGetKeyInfoWithMockServer(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	info, err := getKeyInfo("test-token")
+	info, err := budgetInfo(keyCred("test-token"))
 	if err != nil {
 		t.Fatalf("getKeyInfo() error = %v", err)
 	}
@@ -724,13 +725,13 @@ func TestGetKeyInfoCaching(t *testing.T) {
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
 	// First call — should hit API and write filesystem cache
-	_, err := getKeyInfo("test-token")
+	_, err := budgetInfo(keyCred("test-token"))
 	if err != nil {
 		t.Fatalf("first getKeyInfo() error = %v", err)
 	}
 
 	// Second call — should read from filesystem cache, skip API
-	_, err = getKeyInfo("test-token")
+	_, err = budgetInfo(keyCred("test-token"))
 	if err != nil {
 		t.Fatalf("second getKeyInfo() error = %v", err)
 	}
@@ -751,7 +752,7 @@ func TestGetKeyInfoAuthError(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	_, err := getKeyInfo("bad-token")
+	_, err := budgetInfo(keyCred("bad-token"))
 	if err == nil {
 		t.Fatal("expected auth error, got nil")
 	}
@@ -772,7 +773,7 @@ func TestGetKeyInfoForbiddenError(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	_, err := getKeyInfo("bad-token")
+	_, err := budgetInfo(keyCred("bad-token"))
 	if err == nil {
 		t.Fatal("expected auth error for 403, got nil")
 	}
@@ -794,7 +795,7 @@ func TestGetKeyInfoBudgetExceeded(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	_, err := getKeyInfo("some-token")
+	_, err := budgetInfo(keyCred("some-token"))
 	if err == nil {
 		t.Fatal("expected budget exceeded error, got nil")
 	}
@@ -818,7 +819,7 @@ func TestFetchKeyInfoEmptyBaseURL(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", "")
 
-	_, err := fetchKeyInfo("some-token")
+	_, err := fetchKeyInfo(keyCred("some-token"))
 	if err == nil {
 		t.Fatal("expected error for empty baseURL, got nil")
 	}
@@ -1064,14 +1065,14 @@ func TestBudgetCacheReadWrite(t *testing.T) {
 	info := &KeyInfo{Spend: &spend, MaxBudget: &budget}
 
 	// Nothing in cache yet
-	_, ok := readBudgetCache("test-token")
+	_, ok := readBudgetCache(keyCred("test-token"))
 	if ok {
 		t.Error("expected readBudgetCache to return ok=false with empty cache")
 	}
 
 	// Write and read back
-	writeBudgetCache("test-token", info)
-	got, ok := readBudgetCache("test-token")
+	writeBudgetCache(keyCred("test-token"), info)
+	got, ok := readBudgetCache(keyCred("test-token"))
 	if !ok {
 		t.Fatal("expected readBudgetCache to return ok=true after write")
 	}
@@ -1228,7 +1229,7 @@ func TestFetchTeamInfo(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	data, err := fetchTeamInfo("test-token", "team-123")
+	data, err := fetchTeamInfo(keyCred("test-token"), "team-123")
 	if err != nil {
 		t.Fatalf("fetchTeamInfo() error = %v", err)
 	}
@@ -1293,7 +1294,7 @@ func TestGetKeyInfoUsesMembershipBudget(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	info, err := getKeyInfo("test-token")
+	info, err := budgetInfo(keyCred("test-token"))
 	if err != nil {
 		t.Fatalf("getKeyInfo() error = %v", err)
 	}
@@ -1370,7 +1371,7 @@ func TestGetKeyInfoIgnoresKeySpendWhenNoMembership(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	info, err := getKeyInfo("test-token")
+	info, err := budgetInfo(keyCred("test-token"))
 	if err != nil {
 		t.Fatalf("getKeyInfo() error = %v", err)
 	}
@@ -1430,7 +1431,7 @@ func TestGetKeyInfoFallsBackToTeamLevelBudget(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	info, err := getKeyInfo("test-token")
+	info, err := budgetInfo(keyCred("test-token"))
 	if err != nil {
 		t.Fatalf("getKeyInfo() error = %v", err)
 	}
@@ -1518,27 +1519,27 @@ func TestCacheKeyNamespacing(t *testing.T) {
 
 	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
 	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
-	writeBudgetCache("key-a", info)
-	if _, ok := readBudgetCache("key-a"); !ok {
+	writeBudgetCache(keyCred("key-a"), info)
+	if _, ok := readBudgetCache(keyCred("key-a")); !ok {
 		t.Fatal("expected cache hit for original key+URL")
 	}
 
 	// Different token → must miss.
 	t.Setenv("LITELLM_PROXY_API_KEY", "key-b")
-	if _, ok := readBudgetCache("key-b"); ok {
+	if _, ok := readBudgetCache(keyCred("key-b")); ok {
 		t.Error("expected cache miss after switching token")
 	}
 
 	// Different base URL → must miss.
 	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
 	t.Setenv("LITELLM_PROXY_URL", "https://b.example")
-	if _, ok := readBudgetCache("key-a"); ok {
+	if _, ok := readBudgetCache(keyCred("key-a")); ok {
 		t.Error("expected cache miss after switching base URL")
 	}
 
 	// Back to the original pair → still cached.
 	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
-	if _, ok := readBudgetCache("key-a"); !ok {
+	if _, ok := readBudgetCache(keyCred("key-a")); !ok {
 		t.Error("expected cache hit after returning to original key+URL")
 	}
 }
@@ -1559,12 +1560,12 @@ func TestWriteBudgetCacheConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			writeBudgetCache("key-c", info)
+			writeBudgetCache(keyCred("key-c"), info)
 		}()
 	}
 	wg.Wait()
 
-	got, ok := readBudgetCache("key-c")
+	got, ok := readBudgetCache(keyCred("key-c"))
 	if !ok {
 		t.Fatal("expected a valid (non-torn) cache after concurrent writes")
 	}
@@ -1588,10 +1589,10 @@ func TestGetKeyInfoNegativeCache(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	if _, err := getKeyInfo("test-token"); err == nil {
+	if _, err := budgetInfo(keyCred("test-token")); err == nil {
 		t.Fatal("expected error on first call")
 	}
-	if _, err := getKeyInfo("test-token"); err == nil {
+	if _, err := budgetInfo(keyCred("test-token")); err == nil {
 		t.Fatal("expected error on second call")
 	}
 	if callCount != 1 {
@@ -1614,11 +1615,11 @@ func TestGetKeyInfoNegativeCachePreservesAuthError(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	_, err1 := getKeyInfo("bad-token")
+	_, err1 := budgetInfo(keyCred("bad-token"))
 	if !errors.Is(err1, ErrAuth) {
 		t.Fatalf("expected ErrAuth on first call, got %v", err1)
 	}
-	_, err2 := getKeyInfo("bad-token")
+	_, err2 := budgetInfo(keyCred("bad-token"))
 	if !errors.Is(err2, ErrAuth) {
 		t.Errorf("expected ErrAuth replayed from negative cache, got %v", err2)
 	}
@@ -1970,245 +1971,15 @@ func TestOutputModeParity(t *testing.T) {
 	}
 }
 
-// TestClaudeOAuthTokenFromCredentialsFile covers reading Claude Code's OAuth
-// access token from its credentials file, including every empty-result path.
-func TestClaudeOAuthTokenFromCredentialsFile(t *testing.T) {
-	t.Setenv("LITELLM_PROXY_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-
-	// writeCreds pins the credential read to a temp file so tests never touch
-	// the real ~/.claude/.credentials.json on the dev machine.
-	writeCreds := func(t *testing.T, content string) string {
-		t.Helper()
-		p := filepath.Join(t.TempDir(), ".credentials.json")
-		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-			t.Fatalf("failed to write credentials file: %v", err)
-		}
-		return p
-	}
-
-	t.Run("valid file yields OAuth access token", func(t *testing.T) {
-		p := writeCreds(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"r","expiresAt":"2030-01-01T00:00:00Z"}}`)
-		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
-		if got := claudeOAuthToken(); got != "sk-ant-oat01-test" {
-			t.Errorf("claudeOAuthToken() = %q, want %q", got, "sk-ant-oat01-test")
-		}
-	})
-
-	t.Run("missing file returns empty", func(t *testing.T) {
-		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "absent.json"))
-		if got := claudeOAuthToken(); got != "" {
-			t.Errorf("claudeOAuthToken() = %q, want empty for missing file", got)
-		}
-	})
-
-	t.Run("unreadable file returns empty", func(t *testing.T) {
-		p := writeCreds(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}}`)
-		if err := os.Chmod(p, 0o000); err != nil {
-			t.Fatalf("failed to chmod credentials file: %v", err)
-		}
-		t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
-		if _, err := os.ReadFile(p); err == nil {
-			t.Skip("file still readable (running as root or on a platform without unix perms)")
-		}
-		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
-		if got := claudeOAuthToken(); got != "" {
-			t.Errorf("claudeOAuthToken() = %q, want empty for unreadable file", got)
-		}
-	})
-
-	t.Run("malformed JSON returns empty", func(t *testing.T) {
-		p := writeCreds(t, "{not json at all")
-		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
-		if got := claudeOAuthToken(); got != "" {
-			t.Errorf("claudeOAuthToken() = %q, want empty for malformed JSON", got)
-		}
-	})
-
-	t.Run("JSON without accessToken returns empty", func(t *testing.T) {
-		p := writeCreds(t, `{"claudeAiOauth":{"refreshToken":"r"}}`)
-		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
-		if got := claudeOAuthToken(); got != "" {
-			t.Errorf("claudeOAuthToken() = %q, want empty when accessToken absent", got)
-		}
-	})
-
-	t.Run("credentialsFilePath override wins over default", func(t *testing.T) {
-		p := writeCreds(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-override"}}`)
-		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
-		if got := credentialsFilePath(); got != p {
-			t.Errorf("credentialsFilePath() = %q, want override %q", got, p)
-		}
-	})
+// keyCred builds a virtual-key credential bound to the currently configured
+// base URL, mirroring what resolveCredential returns for env-var keys.
+func keyCred(token string) credential {
+	return credential{token: token, baseURL: getBaseURL()}
 }
 
-// TestGetTokenClaudeOAuthPrecedence pins the full token precedence: env keys win
-// exactly as before; the credentials file is consulted only when neither is set.
-func TestGetTokenClaudeOAuthPrecedence(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".credentials.json")
-	creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-cred"}}`
-	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
-		t.Fatalf("failed to write credentials file: %v", err)
-	}
-	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", path)
-
-	t.Run("primary env key wins over credentials file", func(t *testing.T) {
-		t.Setenv("LITELLM_PROXY_API_KEY", "env-key")
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-		if got := getToken(); got != "env-key" {
-			t.Errorf("getToken() = %q, want %q", got, "env-key")
-		}
-	})
-
-	t.Run("fallback env key wins over credentials file", func(t *testing.T) {
-		t.Setenv("LITELLM_PROXY_API_KEY", "")
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "anthropic-key")
-		if got := getToken(); got != "anthropic-key" {
-			t.Errorf("getToken() = %q, want %q", got, "anthropic-key")
-		}
-	})
-
-	t.Run("credentials file used when both env vars unset", func(t *testing.T) {
-		t.Setenv("LITELLM_PROXY_API_KEY", "")
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-		if got := getToken(); got != "sk-ant-oat01-cred" {
-			t.Errorf("getToken() = %q, want OAuth token from credentials file", got)
-		}
-	})
-}
-
-// TestGetKeyInfoWithClaudeOAuthCredential exercises the SSO scenario end-to-end:
-// no API-key env vars, token acquired from Claude's credentials file, both gateway
-// calls carry it as Bearer, and the statusline renders budget info (no "No API key").
-func TestGetKeyInfoWithClaudeOAuthCredential(t *testing.T) {
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	t.Setenv("LITELLM_PROXY_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-
-	var keyAuth, teamAuth []string
-	teamID := "team-sso"
-	userID := "sso-user@example.com"
-	memberSpend := 4.0
-	memberBudget := 65.0
-	memberDuration := "7d"
-	resetAt := "2026-04-06T00:00:00Z"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/key/info":
-			keyAuth = append(keyAuth, r.Header.Get("Authorization"))
-			resp := KeyInfoResponse{Info: KeyInfo{TeamID: &teamID, UserID: &userID}}
-			_ = json.NewEncoder(w).Encode(resp)
-		case "/team/info":
-			teamAuth = append(teamAuth, r.Header.Get("Authorization"))
-			resp := TeamInfoAPIResponse{
-				TeamInfo: TeamInfoData{
-					MaxBudget:      &memberBudget,
-					BudgetDuration: &memberDuration,
-					BudgetResetAt:  &resetAt,
-				},
-				TeamMemberships: []TeamMembership{
-					{
-						UserID: userID,
-						TeamID: teamID,
-						Spend:  &memberSpend,
-						LitellmBudgetTable: &TeamMemberBudgetTable{
-							MaxBudget:      &memberBudget,
-							BudgetDuration: &memberDuration,
-							BudgetResetAt:  &resetAt,
-						},
-					},
-				},
-			}
-			_ = json.NewEncoder(w).Encode(resp)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	t.Setenv("LITELLM_PROXY_URL", "")
-	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
-
-	path := filepath.Join(t.TempDir(), ".credentials.json")
-	creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-sso"}}`
-	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
-		t.Fatalf("failed to write credentials file: %v", err)
-	}
-	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", path)
-
-	token := getToken()
-	if token != "sk-ant-oat01-sso" {
-		t.Fatalf("getToken() = %q, want OAuth token from credentials file", token)
-	}
-
-	info, err := getKeyInfo(token)
-	if err != nil {
-		t.Fatalf("getKeyInfo() error = %v", err)
-	}
-
-	if len(keyAuth) == 0 {
-		t.Fatal("expected /key/info call")
-	}
-	if len(teamAuth) == 0 {
-		t.Fatal("expected /team/info call")
-	}
-	auths := append(append([]string{}, keyAuth...), teamAuth...)
-	for i, auth := range auths {
-		if auth != "Bearer sk-ant-oat01-sso" {
-			t.Errorf("gateway call %d Authorization = %q, want %q", i, auth, "Bearer sk-ant-oat01-sso")
-		}
-	}
-
-	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 65.0 {
-		t.Errorf("expected TeamMaxBudget=65.0, got %v", info.TeamMaxBudget)
-	}
-
-	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
-	t.Setenv("LITELLM_PLUGIN_PREFIX", "LiteLLM:")
-	result := formatStatusLine(info, "", StatusInput{})
-	if strings.Contains(result, "No API key") {
-		t.Errorf("expected budget info, got 'No API key' in %q", result)
-	}
-	if !strings.Contains(result, "$4.00/$65.00") {
-		t.Errorf("expected $4.00/$65.00 in output, got %q", result)
-	}
-}
-
-// TestCacheKeyNamespacingClaudeOAuth verifies a credentials-file token namespaces
-// the budget cache exactly like an env key does (cacheKey hashes the active token).
-func TestCacheKeyNamespacingClaudeOAuth(t *testing.T) {
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
-	t.Setenv("LITELLM_PROXY_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-
-	path := filepath.Join(t.TempDir(), ".credentials.json")
-	creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-oauth"}}`
-	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
-		t.Fatalf("failed to write credentials file: %v", err)
-	}
-	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", path)
-
-	oauthKey := cacheKey()
-	oauthFile := budgetCacheFile()
-
-	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
-	envKey := cacheKey()
-	envFile := budgetCacheFile()
-
-	if oauthKey == envKey {
-		t.Errorf("expected different cache keys for OAuth token vs env key, both %q", oauthKey)
-	}
-	if oauthFile == envFile {
-		t.Errorf("expected different cache files for OAuth token vs env key, both %q", oauthFile)
-	}
-
-	// Back to the OAuth token — namespacing must be stable per token.
-	t.Setenv("LITELLM_PROXY_API_KEY", "")
-	if again := cacheKey(); again != oauthKey {
-		t.Errorf("cacheKey() not stable per token: %q then %q", oauthKey, again)
-	}
+// gatewayCred builds a gateway SSO credential bound to the configured base URL.
+func gatewayCred(token string) credential {
+	return credential{token: token, baseURL: getBaseURL(), gateway: true}
 }
 
 // --- Gateway SSO credential store (enterpriseGateway + Keychain) ---
@@ -2216,147 +1987,286 @@ func TestCacheKeyNamespacingClaudeOAuth(t *testing.T) {
 // stubKeychain replaces both macOS Keychain probes with canned payloads for the
 // test's lifetime, so tests never touch the real login Keychain. withAccount
 // backs the account-anchored probe (preferred), accountless the fallback probe.
-func stubKeychain(t *testing.T, withAccount, accountless []byte) {
+// Each probe counts its calls so tests can assert reads stop early.
+func stubKeychain(t *testing.T, withAccount, accountless []byte) (withAccountCalls, accountlessCalls *int) {
 	t.Helper()
+	var a, b int
 	origWithAcct, origNoAcct := keychainReadWithAccount, keychainRead
-	keychainReadWithAccount = func() []byte { return withAccount }
-	keychainRead = func() []byte { return accountless }
+	keychainReadWithAccount = func() []byte { a++; return withAccount }
+	keychainRead = func() []byte { b++; return accountless }
 	t.Cleanup(func() { keychainReadWithAccount, keychainRead = origWithAcct, origNoAcct })
+	return &a, &b
 }
 
-func gatewayCredsJSON(jwt string, expiresAtMs int64) string {
-	return fmt.Sprintf(`{"enterpriseGateway":{"jwt":%q,"url":"https://gw.example/claude_code_gateway","expiresAt":%d}}`, jwt, expiresAtMs)
+func gatewayCredsJSON(jwt, gatewayURL string, expiresAtMs int64) string {
+	return fmt.Sprintf(`{"enterpriseGateway":{"jwt":%q,"url":%q,"expiresAt":%d}}`, jwt, gatewayURL, expiresAtMs)
+}
+
+// writeCredsFile pins the credential-store read to a temp file so tests never
+// touch the real ~/.claude/.credentials.json or Keychain on the dev machine.
+func writeCredsFile(t *testing.T, content string) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("failed to write credentials file: %v", err)
+	}
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+}
+
+// clearTokenEnv unsets both API-key env vars so the credential store is consulted.
+func clearTokenEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
 }
 
 func TestExtractGatewayToken(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 	past := time.Now().Add(-time.Hour).UnixMilli()
+	gwURL := "https://gw.example/claude_code_gateway"
 
 	t.Run("valid unexpired token", func(t *testing.T) {
-		if got := extractGatewayToken([]byte(gatewayCredsJSON("gw-jwt", future))); got != "gw-jwt" {
-			t.Errorf("extractGatewayToken() = %q, want %q", got, "gw-jwt")
+		jwt, u := extractGatewayToken([]byte(gatewayCredsJSON("gw-jwt", gwURL, future)))
+		if jwt != "gw-jwt" || u != gwURL {
+			t.Errorf("extractGatewayToken() = (%q, %q), want (gw-jwt, %s)", jwt, u, gwURL)
 		}
 	})
 
 	t.Run("expired token skipped", func(t *testing.T) {
-		if got := extractGatewayToken([]byte(gatewayCredsJSON("gw-jwt", past))); got != "" {
-			t.Errorf("extractGatewayToken() = %q, want empty for expired token", got)
+		if jwt, _ := extractGatewayToken([]byte(gatewayCredsJSON("gw-jwt", gwURL, past))); jwt != "" {
+			t.Errorf("extractGatewayToken() = %q, want empty for expired token", jwt)
 		}
 	})
 
 	t.Run("unknown expiry treated as valid", func(t *testing.T) {
-		payload := []byte(`{"enterpriseGateway":{"jwt":"gw-jwt"}}`)
-		if got := extractGatewayToken(payload); got != "gw-jwt" {
-			t.Errorf("extractGatewayToken() = %q, want %q when expiresAt absent", got, "gw-jwt")
+		payload := []byte(`{"enterpriseGateway":{"jwt":"gw-jwt","url":"https://gw.example/claude_code_gateway"}}`)
+		if jwt, _ := extractGatewayToken(payload); jwt != "gw-jwt" {
+			t.Errorf("extractGatewayToken() = %q, want gw-jwt when expiresAt absent", jwt)
 		}
 	})
 
-	t.Run("absent or malformed payloads", func(t *testing.T) {
+	t.Run("absent, unbound, or malformed payloads", func(t *testing.T) {
 		for name, payload := range map[string][]byte{
 			"no enterpriseGateway key": []byte(`{"claudeAiOauth":{"accessToken":"x"}}`),
+			"missing url":              []byte(`{"enterpriseGateway":{"jwt":"gw-jwt"}}`),
 			"malformed JSON":           []byte("{not json"),
-			"empty jwt":                []byte(`{"enterpriseGateway":{"jwt":""}}`),
+			"empty jwt":                []byte(`{"enterpriseGateway":{"jwt":"","url":"https://gw.example"}}`),
 			"empty payload":            nil,
 		} {
-			if got := extractGatewayToken(payload); got != "" {
-				t.Errorf("%s: extractGatewayToken() = %q, want empty", name, got)
+			if jwt, _ := extractGatewayToken(payload); jwt != "" {
+				t.Errorf("%s: extractGatewayToken() = %q, want empty", name, jwt)
 			}
 		}
 	})
 }
 
-func TestExtractAIOAuthTokenExpiry(t *testing.T) {
-	futureMs := fmt.Sprintf("%d", time.Now().Add(time.Hour).UnixMilli())
-	pastMs := fmt.Sprintf("%d", time.Now().Add(-time.Hour).UnixMilli())
-	futureRFC := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	pastRFC := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-
+// TestGatewayTarget pins where a gateway token may be sent: only to the origin
+// that issued it, only over HTTPS (loopback HTTP excepted).
+func TestGatewayTarget(t *testing.T) {
 	tests := []struct {
-		name    string
-		payload string
-		want    string
+		name       string
+		baseURL    string
+		gatewayURL string
+		want       string
+		ok         bool
 	}{
-		{"epoch-ms future", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%s}}`, futureMs), "tok"},
-		{"epoch-ms expired", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%s}}`, pastMs), ""},
-		{"RFC3339 future", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%q}}`, futureRFC), "tok"},
-		{"RFC3339 expired", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%q}}`, pastRFC), ""},
-		{"no expiresAt", `{"claudeAiOauth":{"accessToken":"tok"}}`, "tok"},
+		{"matching origin", "https://gw.example", "https://gw.example/claude_code_gateway", "https://gw.example", true},
+		{"matching origin, explicit default port", "https://gw.example:443", "https://gw.example/claude_code_gateway", "https://gw.example:443", true},
+		{"host case-insensitive", "https://GW.example", "https://gw.example/claude_code_gateway", "https://GW.example", true},
+		{"different host", "https://other.example", "https://gw.example/claude_code_gateway", "", false},
+		{"lookalike host", "https://gw.example.evil.com", "https://gw.example/claude_code_gateway", "", false},
+		{"different port", "https://gw.example:8443", "https://gw.example/claude_code_gateway", "", false},
+		{"scheme downgrade", "http://gw.example", "https://gw.example/claude_code_gateway", "", false},
+		{"no base URL → stored gateway origin", "", "https://gw.example/claude_code_gateway", "https://gw.example", true},
+		{"no base URL, proxy under a path prefix", "", "https://gw.example/litellm/claude_code_gateway", "https://gw.example/litellm", true},
+		{"plain HTTP gateway rejected", "http://gw.example", "http://gw.example/claude_code_gateway", "", false},
+		{"loopback HTTP allowed", "http://127.0.0.1:4000", "http://127.0.0.1:4000/claude_code_gateway", "http://127.0.0.1:4000", true},
+		{"localhost HTTP allowed", "", "http://localhost:4000/claude_code_gateway", "http://localhost:4000", true},
+		{"non-http scheme rejected", "", "file:///etc/passwd", "", false},
+		{"unparsable gateway URL", "https://gw.example", "://bad", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := extractAIOAuthToken([]byte(tt.payload)); got != tt.want {
-				t.Errorf("extractAIOAuthToken() = %q, want %q", got, tt.want)
+			got, ok := gatewayTarget(tt.baseURL, tt.gatewayURL)
+			if got != tt.want || ok != tt.ok {
+				t.Errorf("gatewayTarget(%q, %q) = (%q, %v), want (%q, %v)", tt.baseURL, tt.gatewayURL, got, ok, tt.want, tt.ok)
 			}
 		})
 	}
 }
 
-// TestResolveTokenGatewayPreferred pins the credential-store precedence inside
-// a single payload: the LiteLLM gateway SSO token beats the Anthropic OAuth
-// token, because only the gateway token is valid against the proxy.
-func TestResolveTokenGatewayPreferred(t *testing.T) {
-	t.Setenv("LITELLM_PROXY_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-	future := time.Now().Add(time.Hour).UnixMilli()
-	p := filepath.Join(t.TempDir(), ".credentials.json")
-	payload := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-file"},"enterpriseGateway":{"jwt":"gw-jwt","expiresAt":%d}}`, future)
-	if err := os.WriteFile(p, []byte(payload), 0o600); err != nil {
-		t.Fatalf("failed to write credentials file: %v", err)
-	}
-	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+// TestResolveCredentialPrecedence pins the full precedence: env keys win
+// exactly as before; the gateway token is used only when neither is set.
+func TestResolveCredentialPrecedence(t *testing.T) {
+	t.Setenv("LITELLM_PROXY_URL", "https://gw.example")
+	writeCredsFile(t, gatewayCredsJSON("gw-jwt", "https://gw.example/claude_code_gateway", time.Now().Add(time.Hour).UnixMilli()))
 
-	tok, isGateway := resolveToken()
-	if tok != "gw-jwt" || !isGateway {
-		t.Errorf("resolveToken() = (%q, %v), want (gw-jwt, true)", tok, isGateway)
-	}
-}
-
-// TestResolveTokenKeychainFallback covers the macOS path where no credentials
-// file exists — Claude Code keeps gateway credentials only in the Keychain.
-// The account-anchored probe is preferred; a stale accountless item must not
-// win once a fresh one is found.
-func TestResolveTokenKeychainFallback(t *testing.T) {
-	t.Setenv("LITELLM_PROXY_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-	t.Setenv("HOME", t.TempDir()) // default credentials file absent
-	future := time.Now().Add(time.Hour).UnixMilli()
-	past := time.Now().Add(-24 * time.Hour).UnixMilli()
-
-	t.Run("fresh gateway token from account-anchored item", func(t *testing.T) {
-		stubKeychain(t,
-			[]byte(gatewayCredsJSON("gw-jwt", future)),                                                         // -a <user> probe
-			[]byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-stale","expiresAt":%d}}`, past)), // -s probe
-		)
-		tok, isGateway := resolveToken()
-		if tok != "gw-jwt" || !isGateway {
-			t.Errorf("resolveToken() = (%q, %v), want (gw-jwt, true)", tok, isGateway)
+	t.Run("primary env key wins", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_API_KEY", "env-key")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		if c := resolveCredential(); c.token != "env-key" || c.gateway {
+			t.Errorf("resolveCredential() = %+v, want env-key", c)
 		}
 	})
 
-	t.Run("claudeAiOauth fallback when no gateway token", func(t *testing.T) {
-		stubKeychain(t,
-			[]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-keychain"}}`),
-			nil,
-		)
-		tok, isGateway := resolveToken()
-		if tok != "sk-ant-oat01-keychain" || isGateway {
-			t.Errorf("resolveToken() = (%q, %v), want (sk-ant-oat01-keychain, false)", tok, isGateway)
+	t.Run("fallback env key wins", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_API_KEY", "")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "anthropic-key")
+		if c := resolveCredential(); c.token != "anthropic-key" || c.gateway {
+			t.Errorf("resolveCredential() = %+v, want anthropic-key", c)
+		}
+	})
+
+	t.Run("gateway token when both env vars unset", func(t *testing.T) {
+		clearTokenEnv(t)
+		c := resolveCredential()
+		if c.token != "gw-jwt" || !c.gateway || c.baseURL != "https://gw.example" {
+			t.Errorf("resolveCredential() = %+v, want gateway gw-jwt at https://gw.example", c)
+		}
+	})
+}
+
+// TestResolveCredentialNeverUsesAnthropicOAuth guards against regressing to
+// sending Claude Code's first-party Anthropic OAuth token to the proxy.
+func TestResolveCredentialNeverUsesAnthropicOAuth(t *testing.T) {
+	clearTokenEnv(t)
+	t.Setenv("LITELLM_PROXY_URL", "https://gw.example")
+	writeCredsFile(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-secret","expiresAt":"2099-01-01T00:00:00Z"}}`)
+	if c := resolveCredential(); c.token != "" {
+		t.Errorf("resolveCredential() token = %q, want empty — claudeAiOauth must never be used", c.token)
+	}
+}
+
+// TestResolveCredentialBoundToIssuer covers the gateway token being withheld
+// when the configured proxy isn't the gateway that issued it.
+func TestResolveCredentialBoundToIssuer(t *testing.T) {
+	clearTokenEnv(t)
+	future := time.Now().Add(time.Hour).UnixMilli()
+
+	t.Run("mismatched base URL withholds token", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_URL", "")
+		t.Setenv("ANTHROPIC_BASE_URL", "https://other-proxy.example")
+		writeCredsFile(t, gatewayCredsJSON("gw-jwt", "https://gw.example/claude_code_gateway", future))
+		if c := resolveCredential(); c.token != "" {
+			t.Errorf("resolveCredential() token = %q, want empty for a different proxy", c.token)
+		}
+	})
+
+	t.Run("no base URL uses stored gateway origin", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_URL", "")
+		t.Setenv("ANTHROPIC_BASE_URL", "")
+		writeCredsFile(t, gatewayCredsJSON("gw-jwt", "https://gw.example/claude_code_gateway", future))
+		c := resolveCredential()
+		if c.token != "gw-jwt" || c.baseURL != "https://gw.example" {
+			t.Errorf("resolveCredential() = %+v, want gw-jwt at https://gw.example", c)
+		}
+	})
+
+	t.Run("plain HTTP gateway withheld", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_URL", "http://gw.example")
+		writeCredsFile(t, gatewayCredsJSON("gw-jwt", "http://gw.example/claude_code_gateway", future))
+		if c := resolveCredential(); c.token != "" {
+			t.Errorf("resolveCredential() token = %q, want empty over plain HTTP", c.token)
+		}
+	})
+}
+
+// TestResolveCredentialKeychain covers the macOS path where no credentials
+// file exists — Claude Code keeps gateway credentials only in the Keychain.
+func TestResolveCredentialKeychain(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Keychain sources are only consulted on macOS")
+	}
+	clearTokenEnv(t)
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", "")
+	t.Setenv("HOME", t.TempDir()) // default credentials file absent
+	t.Setenv("LITELLM_PROXY_URL", "https://gw.example")
+	gwURL := "https://gw.example/claude_code_gateway"
+	future := time.Now().Add(time.Hour).UnixMilli()
+	past := time.Now().Add(-24 * time.Hour).UnixMilli()
+
+	t.Run("account-anchored item wins and stops further reads", func(t *testing.T) {
+		withAcct, noAcct := stubKeychain(t, []byte(gatewayCredsJSON("gw-fresh", gwURL, future)), []byte(gatewayCredsJSON("gw-other", gwURL, future)))
+		c := resolveCredential()
+		if c.token != "gw-fresh" || !c.gateway {
+			t.Errorf("resolveCredential() = %+v, want gw-fresh", c)
+		}
+		if *withAcct != 1 || *noAcct != 0 {
+			t.Errorf("Keychain reads = %d/%d, want 1/0 (stop at first usable token)", *withAcct, *noAcct)
+		}
+	})
+
+	t.Run("expired account item falls back to accountless", func(t *testing.T) {
+		stubKeychain(t, []byte(gatewayCredsJSON("gw-stale", gwURL, past)), []byte(gatewayCredsJSON("gw-fresh", gwURL, future)))
+		if c := resolveCredential(); c.token != "gw-fresh" {
+			t.Errorf("resolveCredential() token = %q, want gw-fresh", c.token)
 		}
 	})
 
 	t.Run("empty keychain yields no token", func(t *testing.T) {
 		stubKeychain(t, nil, nil)
-		if tok, _ := resolveToken(); tok != "" {
-			t.Errorf("resolveToken() = %q, want empty", tok)
+		if c := resolveCredential(); c.token != "" {
+			t.Errorf("resolveCredential() token = %q, want empty", c.token)
 		}
 	})
 
-	t.Run("env key still wins over keychain", func(t *testing.T) {
+	t.Run("env key skips the keychain entirely", func(t *testing.T) {
 		t.Setenv("LITELLM_PROXY_API_KEY", "env-key")
-		stubKeychain(t, []byte(gatewayCredsJSON("gw-jwt", future)), nil)
-		tok, isGateway := resolveToken()
-		if tok != "env-key" || isGateway {
-			t.Errorf("resolveToken() = (%q, %v), want (env-key, false)", tok, isGateway)
+		withAcct, noAcct := stubKeychain(t, []byte(gatewayCredsJSON("gw-jwt", gwURL, future)), nil)
+		if c := resolveCredential(); c.token != "env-key" || c.gateway {
+			t.Errorf("resolveCredential() = %+v, want env-key", c)
+		}
+		if *withAcct+*noAcct != 0 {
+			t.Errorf("Keychain read %d times with an env key set, want 0", *withAcct+*noAcct)
+		}
+	})
+}
+
+// TestCredentialsFileOverrideIsSoleSource keeps tests and non-standard installs
+// deterministic: with the override set, the Keychain is never read.
+func TestCredentialsFileOverrideIsSoleSource(t *testing.T) {
+	clearTokenEnv(t)
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "absent.json"))
+	withAcct, noAcct := stubKeychain(t, []byte(gatewayCredsJSON("gw-jwt", "https://gw.example/claude_code_gateway", time.Now().Add(time.Hour).UnixMilli())), nil)
+	if c := resolveCredential(); c.token != "" {
+		t.Errorf("resolveCredential() token = %q, want empty", c.token)
+	}
+	if *withAcct+*noAcct != 0 {
+		t.Errorf("Keychain read %d times with override set, want 0", *withAcct+*noAcct)
+	}
+}
+
+// TestCacheKeyNamespacingCredential verifies the cache is keyed by the
+// credential in flight: token and base URL both namespace it.
+func TestCacheKeyNamespacingCredential(t *testing.T) {
+	a := credential{token: "gw-jwt", baseURL: "https://a.example", gateway: true}
+	if cacheKey(a) != cacheKey(credential{token: "gw-jwt", baseURL: "https://a.example", gateway: true}) {
+		t.Error("cacheKey not stable for the same credential")
+	}
+	if cacheKey(a) == cacheKey(credential{token: "key-a", baseURL: "https://a.example"}) {
+		t.Error("expected different cache keys for different tokens")
+	}
+	if cacheKey(a) == cacheKey(credential{token: "gw-jwt", baseURL: "https://b.example", gateway: true}) {
+		t.Error("expected different cache keys for different base URLs")
+	}
+}
+
+// TestErrorBodiesRedacted ensures auth errors never echo the response body and
+// other errors cap it, since error text is persisted to the budget-fail cache.
+func TestErrorBodiesRedacted(t *testing.T) {
+	t.Run("auth error omits body", func(t *testing.T) {
+		userInfoServer(t, 401, `{"error":{"message":"token sk-leaky not found"}}`)
+		_, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		if !errors.Is(err, ErrAuth) || strings.Contains(err.Error(), "sk-leaky") {
+			t.Errorf("fetchUserInfo() error = %v, want ErrAuth without body", err)
+		}
+	})
+
+	t.Run("other errors truncate body", func(t *testing.T) {
+		userInfoServer(t, 500, strings.Repeat("x", 5000))
+		_, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		if err == nil || len(err.Error()) > 500 || !strings.Contains(err.Error(), "truncated") {
+			t.Errorf("fetchUserInfo() error length = %d, want truncated body", len(fmt.Sprint(err)))
 		}
 	})
 }
@@ -2379,8 +2289,8 @@ func userInfoServer(t *testing.T, status int, body string) *httptest.Server {
 
 func TestFetchUserInfo(t *testing.T) {
 	t.Run("team budget preferred over user fields", func(t *testing.T) {
-		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100,"budget_duration":"1d","budget_reset_at":"2026-10-01T00:00:00Z"},"teams":[{"team_id":"team-1","team_alias":"Platform","spend":80.25,"max_budget":500,"budget_duration":"1mo","budget_reset_at":"2026-10-31T00:00:00Z"}]}`)
-		info, err := fetchUserInfo("gw-jwt")
+		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"teams":["team-1"],"spend":12.5,"max_budget":100,"budget_duration":"1d","budget_reset_at":"2026-10-01T00:00:00Z"},"teams":[{"team_id":"team-1","team_alias":"Platform","spend":80.25,"max_budget":500,"budget_duration":"1mo","budget_reset_at":"2026-10-31T00:00:00Z"}]}`)
+		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
 		if err != nil {
 			t.Fatalf("fetchUserInfo() error = %v", err)
 		}
@@ -2399,22 +2309,50 @@ func TestFetchUserInfo(t *testing.T) {
 	})
 
 	t.Run("user budget used when scoped team has none", func(t *testing.T) {
-		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","spend":80.25,"max_budget":null}]}`)
-		info, err := fetchUserInfo("gw-jwt")
+		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"teams":["team-1"],"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","spend":80.25,"max_budget":null}]}`)
+		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
 		if err != nil {
 			t.Fatalf("fetchUserInfo() error = %v", err)
 		}
 		if info.TeamID == nil || *info.TeamID != "team-1" {
-			t.Errorf("TeamID = %v, want team-1 (the JWT-scoped team)", info.TeamID)
+			t.Errorf("TeamID = %v, want team-1 (user_info.teams[0])", info.TeamID)
 		}
 		if info.MaxBudget == nil || *info.MaxBudget != 100 {
 			t.Errorf("user budget not mapped: %+v", info)
 		}
 	})
 
+	// Proxy admins get every proxy team in the top-level teams array, in an
+	// order unrelated to the user record — the scoped team must come from
+	// user_info.teams, not teams[0].
+	t.Run("scoped team comes from user_info.teams, not teams[0]", func(t *testing.T) {
+		userInfoServer(t, 200, `{"user_id":"admin-1","user_info":{"teams":["team-mine"]},"teams":[{"team_id":"team-other","max_budget":999},{"team_id":"team-mine","max_budget":50,"spend":5}]}`)
+		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		if err != nil {
+			t.Fatalf("fetchUserInfo() error = %v", err)
+		}
+		if info.TeamID == nil || *info.TeamID != "team-mine" {
+			t.Errorf("TeamID = %v, want team-mine", info.TeamID)
+		}
+		if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 50 {
+			t.Errorf("TeamMaxBudget = %v, want 50 from the scoped team", info.TeamMaxBudget)
+		}
+	})
+
+	t.Run("no teams on user record leaves team unset", func(t *testing.T) {
+		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"teams":[],"max_budget":100},"teams":[{"team_id":"team-other","max_budget":999}]}`)
+		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		if err != nil {
+			t.Fatalf("fetchUserInfo() error = %v", err)
+		}
+		if info.TeamID != nil || info.TeamMaxBudget != nil {
+			t.Errorf("expected no team fields, got TeamID=%v TeamMaxBudget=%v", info.TeamID, info.TeamMaxBudget)
+		}
+	})
+
 	t.Run("401 maps to ErrAuth", func(t *testing.T) {
 		userInfoServer(t, 401, `{"error":"unauthorized"}`)
-		_, err := fetchUserInfo("expired-token")
+		_, err := fetchUserInfo(gatewayCred("expired-token"))
 		if !errors.Is(err, ErrAuth) {
 			t.Errorf("fetchUserInfo() error = %v, want ErrAuth", err)
 		}
@@ -2422,7 +2360,7 @@ func TestFetchUserInfo(t *testing.T) {
 
 	t.Run("non-200 surfaces HTTP error", func(t *testing.T) {
 		userInfoServer(t, 500, `{"error":{"message":"boom"}}`)
-		_, err := fetchUserInfo("gw-jwt")
+		_, err := fetchUserInfo(gatewayCred("gw-jwt"))
 		if err == nil || !strings.Contains(err.Error(), "HTTP error: status=500") {
 			t.Errorf("fetchUserInfo() error = %v, want HTTP error: status=500", err)
 		}
@@ -2430,7 +2368,7 @@ func TestFetchUserInfo(t *testing.T) {
 }
 
 // TestBudgetInfoGatewayTeamEnrichment proves the gateway path mirrors the
-// virtual-key flow: /user/info supplies the JWT-scoped team id, then
+// virtual-key flow: /user/info supplies the scoped team id (user_info.teams[0]), then
 // /team/info supplies the real budget (team_member_budget_table — the field
 // /user/info's team entries do not carry). When the scoped team is unbudgeted
 // entirely, the user-level budget is what gates requests and is displayed.
@@ -2438,7 +2376,7 @@ func TestBudgetInfoGatewayTeamEnrichment(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/user/info", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","team_alias":"PB IT SG","spend":0,"max_budget":null}]}`))
+		_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"teams":["team-1"],"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","team_alias":"PB IT SG","spend":0,"max_budget":null}]}`))
 	})
 	mux.HandleFunc("/team/info", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"team_info":{"spend":7.25,"max_budget":null,"team_member_budget_table":{"max_budget":65,"budget_duration":"7d","budget_reset_at":"2026-10-05T00:00:00Z"}}}`))
@@ -2447,7 +2385,7 @@ func TestBudgetInfoGatewayTeamEnrichment(t *testing.T) {
 	defer server.Close()
 	t.Setenv("LITELLM_PROXY_URL", server.URL)
 
-	info, err := budgetInfo("gw-jwt", true)
+	info, err := budgetInfo(gatewayCred("gw-jwt"))
 	if err != nil {
 		t.Fatalf("budgetInfo(gateway) error = %v", err)
 	}
@@ -2465,7 +2403,7 @@ func TestBudgetInfoGatewayTeamEnrichment(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	mux2 := http.NewServeMux()
 	mux2.HandleFunc("/user/info", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"spend":12.5,"max_budget":100,"budget_duration":"1mo"},"teams":[{"team_id":"team-2","spend":0,"max_budget":null}]}`))
+		_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"teams":["team-2"],"spend":12.5,"max_budget":100,"budget_duration":"1mo"},"teams":[{"team_id":"team-2","spend":0,"max_budget":null}]}`))
 	})
 	mux2.HandleFunc("/team/info", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"team_info":{"spend":0,"max_budget":null}}`))
@@ -2474,7 +2412,7 @@ func TestBudgetInfoGatewayTeamEnrichment(t *testing.T) {
 	defer server2.Close()
 	t.Setenv("LITELLM_PROXY_URL", server2.URL)
 
-	info, err = budgetInfo("gw-jwt", true)
+	info, err = budgetInfo(gatewayCred("gw-jwt"))
 	if err != nil {
 		t.Fatalf("budgetInfo(gateway, unbudgeted team) error = %v", err)
 	}
@@ -2501,7 +2439,7 @@ func TestBudgetInfoGatewayRouting(t *testing.T) {
 			_, _ = w.Write([]byte(`{"error":{"message":"where.token: A value is required but not set"}}`))
 		case "/user/info":
 			userInfoHits++
-			_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"spend":1,"max_budget":10},"teams":[]}`))
+			_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"teams":[],"spend":1,"max_budget":10},"teams":[]}`))
 		default:
 			w.WriteHeader(404)
 		}
@@ -2509,7 +2447,7 @@ func TestBudgetInfoGatewayRouting(t *testing.T) {
 	defer server.Close()
 	t.Setenv("LITELLM_PROXY_URL", server.URL)
 
-	if _, err := budgetInfo("gw-jwt", true); err != nil {
+	if _, err := budgetInfo(gatewayCred("gw-jwt")); err != nil {
 		t.Fatalf("budgetInfo(gateway) error = %v", err)
 	}
 	if keyInfoHits != 0 || userInfoHits != 1 {
@@ -2526,7 +2464,7 @@ func TestBudgetInfoGatewayRouting(t *testing.T) {
 		}
 		w.WriteHeader(404)
 	})
-	if _, err := budgetInfo("sk-key", false); err != nil {
+	if _, err := budgetInfo(keyCred("sk-key")); err != nil {
 		t.Fatalf("budgetInfo(virtual key) error = %v", err)
 	}
 	if keyInfoHits != 1 || userInfoHits != 0 {

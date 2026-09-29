@@ -98,12 +98,19 @@ export ANTHROPIC_AUTH_TOKEN="your-api-key"
 export LITELLM_PROXY_API_KEY="your-api-key"
 ```
 
-**SSO / gateway auth (no API key):** If you authenticate Claude Code via SSO, the plugin reads the token from Claude Code's credential store instead of an API key. When neither `LITELLM_PROXY_API_KEY` nor `ANTHROPIC_AUTH_TOKEN` is set:
+**SSO / gateway auth (no API key):** If Claude Code signs in through a LiteLLM gateway (`forceLoginMethod: "gateway"` managed setting + `/login` device flow, see the [LiteLLM gateway tutorial](https://docs.litellm.ai/docs/tutorials/claude_code_gateway)), the plugin can use the LiteLLM token Claude Code stores (`enterpriseGateway`) instead of an API key. It is only consulted when neither `LITELLM_PROXY_API_KEY` nor `ANTHROPIC_AUTH_TOKEN` is set, and budgets are read from `GET /user/info` — the gateway token is not a database key, so `/key/info` does not apply to it.
 
-1. **LiteLLM gateway SSO token** — when Claude Code signs in through a LiteLLM gateway (`forceLoginMethod: "gateway"` managed setting + `/login` device flow, see the [LiteLLM gateway tutorial](https://docs.litellm.ai/docs/tutorials/claude_code_gateway)), the plugin uses the stored `enterpriseGateway` token and reads budgets from `GET /user/info` — the gateway token is not a database key, so `/key/info` does not apply to it.
-2. **Claude Code OAuth credential** — otherwise the Anthropic OAuth access token (`claudeAiOauth.accessToken`) from `~/.claude/.credentials.json`. Override the path with `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE`.
+The token is only sent to the gateway that issued it:
 
-On macOS, Claude Code keeps credentials in the login Keychain (service `Claude Code-credentials`) rather than in a file, and the plugin reads them with `security find-generic-password`. If the file is absent, point `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE` at a credentials file, or export an API key as before. The first read may show a macOS prompt asking to allow access to the item — choosing **Always Allow** silences it for future refreshes. Expired tokens are skipped — a gateway token lapses after ~24 hours (LiteLLM issues no refresh token), so run `/login` in Claude Code again when that happens.
+- If `LITELLM_PROXY_URL` / `ANTHROPIC_BASE_URL` is set, its scheme, host, and port must match the gateway URL stored with the token; otherwise the token is withheld (`No API key`). If neither is set, the stored gateway URL is used.
+- The gateway must use HTTPS (plain HTTP is only allowed to `localhost` / loopback).
+- Claude Code's Anthropic OAuth token (`claudeAiOauth`) is never used — it is an Anthropic credential, not a LiteLLM one.
+
+The plugin checks `~/.claude/.credentials.json` first. On macOS, Claude Code keeps credentials in the login Keychain (service `Claude Code-credentials`) instead, so the plugin then reads that item with `/usr/bin/security find-generic-password`. `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE` points at a specific file and disables the Keychain lookup.
+
+> **Keychain prompt:** macOS may ask whether `security` can access the `Claude Code-credentials` item. **Allow** grants access once. **Always Allow** adds `/usr/bin/security` to the item's access list, which lets *any* process running as you read the item through `security` without a prompt. Prefer **Allow**, or set `LITELLM_PROXY_API_KEY` instead if the repeated prompt is a problem. To revoke an earlier "Always Allow", open Keychain Access → `Claude Code-credentials` → Get Info → Access Control and remove `security`.
+
+Expired tokens are skipped — a gateway token lapses after ~24 hours (LiteLLM issues no refresh token), so run `/login` in Claude Code again when that happens. With multiple teams, the statusline shows the first team on your LiteLLM user record — the team LiteLLM scopes the gateway token to.
 
 ### Claude Code Settings
 
@@ -168,13 +175,13 @@ The plugin checks environment variables in the following order:
 
 1. `LITELLM_PROXY_API_KEY`
 2. `ANTHROPIC_AUTH_TOKEN`
-3. Claude Code credential store — the LiteLLM gateway SSO token (`enterpriseGateway`) when Claude Code is signed in through a LiteLLM gateway, else the OAuth credential (`~/.claude/.credentials.json`, override with `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE`; on macOS read from the Keychain) — used only when both env vars are unset
+3. Claude Code credential store — the LiteLLM gateway SSO token (`enterpriseGateway`) when Claude Code is signed in through a LiteLLM gateway (macOS Keychain, else `~/.claude/.credentials.json`; override with `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE`) — used only when both env vars are unset, and only sent to the HTTPS gateway that issued it
 
 ## Troubleshooting
 
 If the statusline shows an error:
 
-- `No API key` - Set either `ANTHROPIC_AUTH_TOKEN` or `LITELLM_PROXY_API_KEY`, or sign in to Claude Code via SSO (`/login`) so a credential exists in `~/.claude/.credentials.json` or, on macOS, the login Keychain (read automatically; `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE` forces a file)
+- `No API key` - Set either `ANTHROPIC_AUTH_TOKEN` or `LITELLM_PROXY_API_KEY`, or sign in to Claude Code through a LiteLLM gateway (`/login`). With gateway SSO, also check the token hasn't expired and that `LITELLM_PROXY_URL` / `ANTHROPIC_BASE_URL` (if set) points at the same HTTPS host as the gateway
 - `no budget configured` - Your LiteLLM user (or the gateway token's scoped team) has no `max_budget`; set one in LiteLLM to see budget info
 - `Auth error` - Check your API key is valid; with gateway SSO the token may have lapsed — run `/login` in Claude Code again
 - `Connection error` - Check your base URL and network connection
