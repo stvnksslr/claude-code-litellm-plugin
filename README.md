@@ -98,6 +98,13 @@ export ANTHROPIC_AUTH_TOKEN="your-api-key"
 export LITELLM_PROXY_API_KEY="your-api-key"
 ```
 
+**SSO / gateway auth (no API key):** If you authenticate Claude Code via SSO, the plugin can use Claude's OAuth credential instead of an API key. When neither `LITELLM_PROXY_API_KEY` nor `ANTHROPIC_AUTH_TOKEN` is set, it falls back to the OAuth access token in Claude Code's credentials file (`~/.claude/.credentials.json`). Override the path with `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE`.
+
+> On macOS, Claude Code typically stores OAuth credentials in the Keychain
+> rather than in this file. If the file is absent, point
+> `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE` at a credentials file, or export an
+> API key as before.
+
 ### Claude Code Settings
 
 Add the statusline configuration to your Claude Code settings file:
@@ -161,12 +168,13 @@ The plugin checks environment variables in the following order:
 
 1. `LITELLM_PROXY_API_KEY`
 2. `ANTHROPIC_AUTH_TOKEN`
+3. Claude Code OAuth credential file (`~/.claude/.credentials.json`; override with `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE`) — used only when both env vars are unset
 
 ## Troubleshooting
 
 If the statusline shows an error:
 
-- `No API key` - Set either `ANTHROPIC_AUTH_TOKEN` or `LITELLM_PROXY_API_KEY`
+- `No API key` - Set either `ANTHROPIC_AUTH_TOKEN` or `LITELLM_PROXY_API_KEY`, or make sure Claude Code's OAuth credential file exists (`~/.claude/.credentials.json`; macOS may keep it in the Keychain — use `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE` to point at a file)
 - `Auth error` - Check your API key is valid
 - `Connection error` - Check your base URL and network connection
 - `Error` - Generic error, check logs for details

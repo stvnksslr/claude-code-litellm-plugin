@@ -42,7 +42,8 @@ const (
 // ErrAuth is returned when the API responds with a 401 or 403 status.
 var ErrAuth = errors.New("auth error")
 
-// ErrNoAPIKey is returned when neither LITELLM_PROXY_API_KEY nor ANTHROPIC_AUTH_TOKEN is set.
+// ErrNoAPIKey is returned when neither LITELLM_PROXY_API_KEY nor ANTHROPIC_AUTH_TOKEN is set
+// and no Claude Code OAuth credential (~/.claude/.credentials.json) is readable.
 var ErrNoAPIKey = errors.New("no api key")
 
 // ErrBudgetExceeded is returned when the API reports the key's budget has been exceeded.
@@ -481,9 +482,58 @@ func getBaseURL() string {
 	return strings.TrimSuffix(url, "/")
 }
 
-// getToken returns the API token from environment
+// getToken returns the gateway auth token. Precedence:
+//  1. LITELLM_PROXY_API_KEY env var
+//  2. ANTHROPIC_AUTH_TOKEN env var
+//  3. Claude Code's OAuth access token from its credentials file (SSO logins)
+//
+// API-key mode is unchanged — env vars win exactly as before; the credential
+// file is only consulted when neither env var is set.
 func getToken() string {
-	return getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+	if tok := getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN"); tok != "" {
+		return tok
+	}
+	return claudeOAuthToken()
+}
+
+// credentialsFilePath returns the path to Claude Code's OAuth credentials file.
+// LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE overrides the default location for
+// non-standard installs and tests. Returns "" when no path can be determined.
+func credentialsFilePath() string {
+	if p := os.Getenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE"); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".claude", ".credentials.json")
+}
+
+// claudeOAuthToken extracts Claude Code's OAuth access token from its credentials
+// file (default ~/.claude/.credentials.json), so a gateway + SSO setup works without
+// any API-key env var. The file carries {"claudeAiOauth":{"accessToken":"sk-ant-oat01-…"}}.
+// Any failure (missing file, unreadable, malformed JSON, no accessToken) returns "" —
+// the caller falls through to the normal no-token error path. The local read is cheap
+// and fail-fast (matching the 3s HTTP budget); the token is never logged.
+func claudeOAuthToken() string {
+	path := credentialsFilePath()
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var creds struct {
+		ClaudeAiOauth struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return ""
+	}
+	return creds.ClaudeAiOauth.AccessToken
 }
 
 // isShowCostEnabled returns true only when LITELLM_PLUGIN_SHOW_COST is explicitly enabled.

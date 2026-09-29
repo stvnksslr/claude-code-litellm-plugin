@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1966,5 +1967,246 @@ func TestOutputModeParity(t *testing.T) {
 				t.Errorf("output drift between --json and stdout:\n  json text:  %q\n  stripped:   %q", jsonOut.Text, stripped)
 			}
 		})
+	}
+}
+
+// TestClaudeOAuthTokenFromCredentialsFile covers reading Claude Code's OAuth
+// access token from its credentials file, including every empty-result path.
+func TestClaudeOAuthTokenFromCredentialsFile(t *testing.T) {
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+
+	// writeCreds pins the credential read to a temp file so tests never touch
+	// the real ~/.claude/.credentials.json on the dev machine.
+	writeCreds := func(t *testing.T, content string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), ".credentials.json")
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatalf("failed to write credentials file: %v", err)
+		}
+		return p
+	}
+
+	t.Run("valid file yields OAuth access token", func(t *testing.T) {
+		p := writeCreds(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"r","expiresAt":"2030-01-01T00:00:00Z"}}`)
+		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+		if got := claudeOAuthToken(); got != "sk-ant-oat01-test" {
+			t.Errorf("claudeOAuthToken() = %q, want %q", got, "sk-ant-oat01-test")
+		}
+	})
+
+	t.Run("missing file returns empty", func(t *testing.T) {
+		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "absent.json"))
+		if got := claudeOAuthToken(); got != "" {
+			t.Errorf("claudeOAuthToken() = %q, want empty for missing file", got)
+		}
+	})
+
+	t.Run("unreadable file returns empty", func(t *testing.T) {
+		p := writeCreds(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}}`)
+		if err := os.Chmod(p, 0o000); err != nil {
+			t.Fatalf("failed to chmod credentials file: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
+		if _, err := os.ReadFile(p); err == nil {
+			t.Skip("file still readable (running as root or on a platform without unix perms)")
+		}
+		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+		if got := claudeOAuthToken(); got != "" {
+			t.Errorf("claudeOAuthToken() = %q, want empty for unreadable file", got)
+		}
+	})
+
+	t.Run("malformed JSON returns empty", func(t *testing.T) {
+		p := writeCreds(t, "{not json at all")
+		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+		if got := claudeOAuthToken(); got != "" {
+			t.Errorf("claudeOAuthToken() = %q, want empty for malformed JSON", got)
+		}
+	})
+
+	t.Run("JSON without accessToken returns empty", func(t *testing.T) {
+		p := writeCreds(t, `{"claudeAiOauth":{"refreshToken":"r"}}`)
+		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+		if got := claudeOAuthToken(); got != "" {
+			t.Errorf("claudeOAuthToken() = %q, want empty when accessToken absent", got)
+		}
+	})
+
+	t.Run("credentialsFilePath override wins over default", func(t *testing.T) {
+		p := writeCreds(t, `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-override"}}`)
+		t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", p)
+		if got := credentialsFilePath(); got != p {
+			t.Errorf("credentialsFilePath() = %q, want override %q", got, p)
+		}
+	})
+}
+
+// TestGetTokenClaudeOAuthPrecedence pins the full token precedence: env keys win
+// exactly as before; the credentials file is consulted only when neither is set.
+func TestGetTokenClaudeOAuthPrecedence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".credentials.json")
+	creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-cred"}}`
+	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
+		t.Fatalf("failed to write credentials file: %v", err)
+	}
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", path)
+
+	t.Run("primary env key wins over credentials file", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_API_KEY", "env-key")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		if got := getToken(); got != "env-key" {
+			t.Errorf("getToken() = %q, want %q", got, "env-key")
+		}
+	})
+
+	t.Run("fallback env key wins over credentials file", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_API_KEY", "")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "anthropic-key")
+		if got := getToken(); got != "anthropic-key" {
+			t.Errorf("getToken() = %q, want %q", got, "anthropic-key")
+		}
+	})
+
+	t.Run("credentials file used when both env vars unset", func(t *testing.T) {
+		t.Setenv("LITELLM_PROXY_API_KEY", "")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		if got := getToken(); got != "sk-ant-oat01-cred" {
+			t.Errorf("getToken() = %q, want OAuth token from credentials file", got)
+		}
+	})
+}
+
+// TestGetKeyInfoWithClaudeOAuthCredential exercises the SSO scenario end-to-end:
+// no API-key env vars, token acquired from Claude's credentials file, both gateway
+// calls carry it as Bearer, and the statusline renders budget info (no "No API key").
+func TestGetKeyInfoWithClaudeOAuthCredential(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+
+	var keyAuth, teamAuth []string
+	teamID := "team-sso"
+	userID := "sso-user@example.com"
+	memberSpend := 4.0
+	memberBudget := 65.0
+	memberDuration := "7d"
+	resetAt := "2026-04-06T00:00:00Z"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/key/info":
+			keyAuth = append(keyAuth, r.Header.Get("Authorization"))
+			resp := KeyInfoResponse{Info: KeyInfo{TeamID: &teamID, UserID: &userID}}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/team/info":
+			teamAuth = append(teamAuth, r.Header.Get("Authorization"))
+			resp := TeamInfoAPIResponse{
+				TeamInfo: TeamInfoData{
+					MaxBudget:      &memberBudget,
+					BudgetDuration: &memberDuration,
+					BudgetResetAt:  &resetAt,
+				},
+				TeamMemberships: []TeamMembership{
+					{
+						UserID: userID,
+						TeamID: teamID,
+						Spend:  &memberSpend,
+						LitellmBudgetTable: &TeamMemberBudgetTable{
+							MaxBudget:      &memberBudget,
+							BudgetDuration: &memberDuration,
+							BudgetResetAt:  &resetAt,
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	path := filepath.Join(t.TempDir(), ".credentials.json")
+	creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-sso"}}`
+	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
+		t.Fatalf("failed to write credentials file: %v", err)
+	}
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", path)
+
+	token := getToken()
+	if token != "sk-ant-oat01-sso" {
+		t.Fatalf("getToken() = %q, want OAuth token from credentials file", token)
+	}
+
+	info, err := getKeyInfo(token)
+	if err != nil {
+		t.Fatalf("getKeyInfo() error = %v", err)
+	}
+
+	if len(keyAuth) == 0 {
+		t.Fatal("expected /key/info call")
+	}
+	if len(teamAuth) == 0 {
+		t.Fatal("expected /team/info call")
+	}
+	auths := append(append([]string{}, keyAuth...), teamAuth...)
+	for i, auth := range auths {
+		if auth != "Bearer sk-ant-oat01-sso" {
+			t.Errorf("gateway call %d Authorization = %q, want %q", i, auth, "Bearer sk-ant-oat01-sso")
+		}
+	}
+
+	if info.TeamMaxBudget == nil || *info.TeamMaxBudget != 65.0 {
+		t.Errorf("expected TeamMaxBudget=65.0, got %v", info.TeamMaxBudget)
+	}
+
+	t.Setenv("LITELLM_PLUGIN_SHOW_COST", "1")
+	t.Setenv("LITELLM_PLUGIN_PREFIX", "LiteLLM:")
+	result := formatStatusLine(info, "", StatusInput{})
+	if strings.Contains(result, "No API key") {
+		t.Errorf("expected budget info, got 'No API key' in %q", result)
+	}
+	if !strings.Contains(result, "$4.00/$65.00") {
+		t.Errorf("expected $4.00/$65.00 in output, got %q", result)
+	}
+}
+
+// TestCacheKeyNamespacingClaudeOAuth verifies a credentials-file token namespaces
+// the budget cache exactly like an env key does (cacheKey hashes the active token).
+func TestCacheKeyNamespacingClaudeOAuth(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("LITELLM_PROXY_URL", "https://a.example")
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+
+	path := filepath.Join(t.TempDir(), ".credentials.json")
+	creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-oauth"}}`
+	if err := os.WriteFile(path, []byte(creds), 0o600); err != nil {
+		t.Fatalf("failed to write credentials file: %v", err)
+	}
+	t.Setenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE", path)
+
+	oauthKey := cacheKey()
+	oauthFile := budgetCacheFile()
+
+	t.Setenv("LITELLM_PROXY_API_KEY", "key-a")
+	envKey := cacheKey()
+	envFile := budgetCacheFile()
+
+	if oauthKey == envKey {
+		t.Errorf("expected different cache keys for OAuth token vs env key, both %q", oauthKey)
+	}
+	if oauthFile == envFile {
+		t.Errorf("expected different cache files for OAuth token vs env key, both %q", oauthFile)
+	}
+
+	// Back to the OAuth token — namespacing must be stable per token.
+	t.Setenv("LITELLM_PROXY_API_KEY", "")
+	if again := cacheKey(); again != oauthKey {
+		t.Errorf("cacheKey() not stable per token: %q then %q", oauthKey, again)
 	}
 }

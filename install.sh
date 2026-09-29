@@ -161,8 +161,8 @@ main() {
     if [ -z "${ANTHROPIC_BASE_URL:-}" ] && [ -z "${LITELLM_PROXY_URL:-}" ]; then
         missing_vars+=("ANTHROPIC_BASE_URL or LITELLM_PROXY_URL")
     fi
-    if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${LITELLM_PROXY_API_KEY:-}" ]; then
-        missing_vars+=("ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY")
+    if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${LITELLM_PROXY_API_KEY:-}" ] && [ ! -f "${HOME}/.claude/.credentials.json" ]; then
+        missing_vars+=("ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY (or log in via SSO so ~/.claude/.credentials.json exists)")
     fi
 
     if [ ${#missing_vars[@]} -gt 0 ]; then
