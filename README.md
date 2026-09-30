@@ -41,7 +41,8 @@ chmod +x ~/.local/bin/claude-code-litellm-plugin
 {
   "statusLine": {
     "type": "command",
-    "command": "claude-code-litellm-plugin"
+    "command": "claude-code-litellm-plugin",
+    "refreshInterval": 30
   }
 }
 ```
@@ -122,7 +123,8 @@ Add the statusline configuration to your Claude Code settings file:
 {
   "statusLine": {
     "type": "command",
-    "command": "claude-code-litellm-plugin"
+    "command": "claude-code-litellm-plugin",
+    "refreshInterval": 30
   }
 }
 ```
@@ -133,10 +135,13 @@ Add the statusline configuration to your Claude Code settings file:
 {
   "statusLine": {
     "type": "command",
-    "command": "claude-code-litellm-plugin"
+    "command": "claude-code-litellm-plugin",
+    "refreshInterval": 30
   }
 }
 ```
+
+**`refreshInterval`:** Claude Code only re-runs the statusline on events (new messages, `/compact`, mode changes, …), so without a timer an idle session keeps showing whatever it rendered at launch. `refreshInterval` (seconds) also re-runs it on a timer. The plugin caches budget data for 30s, so values below 30 re-render the same numbers without fetching more often.
 
 ## Output
 

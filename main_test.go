@@ -2471,3 +2471,33 @@ func TestBudgetInfoGatewayRouting(t *testing.T) {
 		t.Errorf("virtual key hit /key/info=%d /user/info=%d, want 1/0", keyInfoHits, userInfoHits)
 	}
 }
+
+func TestSweepStaleTemps(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "budget.json.tmp-1")
+	fresh := filepath.Join(dir, "budget.json.tmp-2")
+	keep := filepath.Join(dir, "budget.json")
+	for _, p := range []string{stale, fresh, keep} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * staleTempAge)
+	for _, p := range []string{stale, keep} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweepStaleTemps(dir)
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale temp file should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh temp file should survive (may be mid-write): %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("non-temp cache file should survive: %v", err)
+	}
+}

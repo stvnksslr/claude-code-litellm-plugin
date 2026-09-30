@@ -240,12 +240,29 @@ func updateCacheFile() string {
 	return filepath.Join(cacheDir(), "update.json")
 }
 
+// staleTempAge is how old an orphaned "*.tmp-*" file must be before it is swept.
+// Claude Code cancels in-flight statusline processes when a new refresh starts, which
+// can kill us between CreateTemp and Rename and leave the temp file behind.
+const staleTempAge = time.Minute
+
+// sweepStaleTemps removes orphaned temp files left in dir by killed processes. The age
+// threshold keeps it from racing a concurrent process that is mid-write.
+func sweepStaleTemps(dir string) {
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && time.Since(fi.ModTime()) > staleTempAge {
+			_ = os.Remove(m)
+		}
+	}
+}
+
 // writeFileAtomic writes data to path atomically: it writes to a uniquely-named temp
 // file in the same directory, then renames it into place. Rename is atomic on the same
 // filesystem, so concurrent statusline processes (or goroutines) never observe a torn
 // file. The directory must already exist.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
+	sweepStaleTemps(dir)
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
