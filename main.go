@@ -214,6 +214,9 @@ type StatusInput struct {
 	ContextWindow *struct {
 		UsedPercentage *float64 `json:"used_percentage"`
 	} `json:"context_window"`
+	Effort struct {
+		Level string `json:"level"`
+	} `json:"effort"`
 }
 
 // readStatusInput decodes the JSON payload Claude Code sends on stdin.
@@ -894,6 +897,13 @@ func isShowCostEnabled() bool {
 	return val == "1" || val == "true"
 }
 
+// isShowEffortEnabled returns true only when LITELLM_PLUGIN_SHOW_EFFORT is explicitly enabled.
+// Default is true — current effort is not displayed.
+func isShowEffortEnabled() bool {
+	val := os.Getenv("LITELLM_PLUGIN_SHOW_EFFORT")
+	return val == "1" || val == "true"
+}
+
 // getPrefix returns the status line prefix.
 // Precedence: LITELLM_PLUGIN_PREFIX (if set, even to empty) > stdin model display name > "LiteLLM: ".
 func getPrefix(input StatusInput) string {
@@ -1442,10 +1452,15 @@ func formatStatusLine(info *KeyInfo, latestVersion string, input StatusInput) st
 		}
 	}
 
+	effortStr := ""
+	if isShowEffortEnabled() && input.Effort.Level != "" {
+		effortStr = fmt.Sprintf(" | effort: %s", input.Effort.Level)
+	}
+
 	line := fmt.Sprintf("%s%s%s%s %s%s%s",
 		prefix, absColor, circleGlyph(percent), ColorReset, absColor, budgetStr, ColorReset)
 
-	line += resetStr + updateStr + contextStr
+	line += resetStr + updateStr + contextStr + effortStr
 	return line
 }
 

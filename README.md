@@ -109,6 +109,7 @@ claude-code-litellm-plugin doctor
 | `LITELLM_PROXY_URL`, then `ANTHROPIC_BASE_URL` | LiteLLM proxy root URL |
 | `LITELLM_PROXY_API_KEY`, then `ANTHROPIC_AUTH_TOKEN` | API key (see SSO below for the no-key option) |
 | `LITELLM_PLUGIN_SHOW_COST=1` | show `$spend/$budget (pct%)` instead of just the percentage |
+| `LITELLM_PLUGIN_SHOW_EFFORT=1` | append the current effort level to the status line |
 | `LITELLM_PLUGIN_PREFIX` | replace the model-name prefix (set to empty for none) |
 | `LITELLM_PLUGIN_UPDATE_CHECK=0` | disable the hourly GitHub "update available" check (e.g. on restricted networks) |
 | `LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE` | read the gateway SSO token from this file only (disables the Keychain lookup) |
