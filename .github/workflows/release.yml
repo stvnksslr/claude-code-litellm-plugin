@@ -1,8 +1,12 @@
 name: Release
 
+# release.sh pushes the tag. One job does everything in order, so the GitHub
+# release only becomes visible once every asset is uploaded: GoReleaser creates
+# it as a draft, uploads binaries + .vsix + IntelliJ zip + checksums, publishes
+# it, and only then updates the Homebrew tap / Scoop bucket.
 on:
-  release:
-    types: [ published ]
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+', '[0-9]+.[0-9]+.[0-9]+-*']
 
 permissions:
   contents: write
@@ -12,75 +16,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: mise install
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v5
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
+      - name: go test
+        run: go test -count=1 ./...
+
+      - name: Build editor plugins (version-stamped)
+        run: mise run release:artifacts "${GITHUB_REF_NAME}"
+
+      - name: GoReleaser
+        run: goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  vscode:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: mise install
-        uses: jdx/mise-action@v2
-
-      - name: Stamp version from tag
-        run: |
-          # Tag is "0.4.0" — vsce wants "0.4.0", not "v0.4.0"
-          VERSION="${GITHUB_REF_NAME:-${{ github.event.release.tag_name }}}"
-          VERSION="${VERSION#v}"
-          echo "Version: $VERSION"
-          # Patch package.json in place
-          jq --arg v "$VERSION" '.version = $v' vscode-extension/package.json > /tmp/pkg.json
-          mv /tmp/pkg.json vscode-extension/package.json
-
-      - name: Build VS Code extension
-        working-directory: vscode-extension
-        run: |
-          npm ci
-          npm run compile
-          npm run package
-
-      - name: Upload VS Code extension to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: vscode-extension/claude-code-litellm-*.vsix
-
-  intellij:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: mise install
-        uses: jdx/mise-action@v2
-
-      - name: Stamp version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME:-${{ github.event.release.tag_name }}}"
-          VERSION="${VERSION#v}"
-          echo "Version: $VERSION"
-          # Patch build.gradle.kts version in place
-          sed -i "s/version = \"0.0.0-dev\"/version = \"$VERSION\"/" intellij-plugin/build.gradle.kts
-
-      - name: Build IntelliJ plugin
-        working-directory: intellij-plugin
-        run: ./gradlew buildPlugin --console=plain
-
-      - name: Upload IntelliJ plugin to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: intellij-plugin/build/distributions/claude-code-litellm-intellij-*.zip
+          # Fine-grained PAT with contents:write on stvnksslr/homebrew-tap and
+          # stvnksslr/scoop-bucket. When unset, the tap/bucket update is skipped.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

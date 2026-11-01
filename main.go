@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -37,11 +39,16 @@ const (
 
 // Cache configuration
 const (
-	CacheTTLMs         = 30_000          // 30 seconds in milliseconds
-	BudgetFailTTLMs    = 10_000          // negative-cache window for failed budget fetches
-	HTTPTimeout        = 3 * time.Second // fast failure for subprocess/statusline use
-	UpdateCheckTTLMs   = 60 * 60 * 1_000 // 1 hour in milliseconds
-	UpdateCheckTimeout = 5 * time.Second
+	CacheTTLMs       = 30_000          // 30 seconds in milliseconds
+	BudgetFailTTLMs  = 10_000          // negative-cache window for failed budget fetches
+	HTTPTimeout      = 3 * time.Second // fast failure for subprocess/statusline use
+	UpdateCheckTTLMs = 60 * 60 * 1_000 // 1 hour in milliseconds
+	// UpdateCheckTimeout is short because the check runs alongside the budget fetch
+	// and editors kill the binary after a few seconds.
+	UpdateCheckTimeout = 2 * time.Second
+	// BudgetDeadline bounds the whole budget fetch (/key/info or /user/info plus
+	// /team/info), so the binary answers before editor plugins time it out.
+	BudgetDeadline = 4 * time.Second
 )
 
 // ErrAuth is returned when the API responds with a 401 or 403 status.
@@ -51,8 +58,23 @@ var ErrAuth = errors.New("auth error")
 // and Claude Code's credential store holds no usable LiteLLM gateway SSO token.
 var ErrNoAPIKey = errors.New("no api key")
 
+// ErrNoBaseURL is returned when a token is available but neither LITELLM_PROXY_URL
+// nor ANTHROPIC_BASE_URL is set (and no gateway URL could be derived).
+var ErrNoBaseURL = errors.New("no LiteLLM proxy URL configured (set LITELLM_PROXY_URL or ANTHROPIC_BASE_URL)")
+
 // ErrBudgetExceeded is returned when the API reports the key's budget has been exceeded.
 var ErrBudgetExceeded = errors.New("budget exceeded")
+
+// httpStatusError is a non-2xx response that isn't an auth or budget error.
+type httpStatusError struct {
+	Status int
+	URL    string
+	Body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP error: status=%d url=%s body=%s", e.Status, e.URL, e.Body)
+}
 
 // BudgetExceededError wraps ErrBudgetExceeded with the spend/budget values parsed from the error message.
 type BudgetExceededError struct {
@@ -209,8 +231,23 @@ func cacheDir() string {
 	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
 		return filepath.Join(xdg, "claude-code-litellm")
 	}
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		// Never fall back to a relative path: Claude Code runs us from the project dir.
+		return filepath.Join(os.TempDir(), "claude-code-litellm")
+	}
 	return filepath.Join(home, ".cache", "claude-code-litellm")
+}
+
+// writeCacheFile writes one cache file atomically, creating the cache dir and
+// sweeping temp files orphaned by killed processes. Best-effort.
+func writeCacheFile(path string, data []byte) {
+	dir := cacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	sweepStaleTemps(dir)
+	_ = writeFileAtomic(path, data, 0o600)
 }
 
 // cacheKey returns a short, stable hash of the credential's base URL + token so
@@ -259,10 +296,10 @@ func sweepStaleTemps(dir string) {
 // writeFileAtomic writes data to path atomically: it writes to a uniquely-named temp
 // file in the same directory, then renames it into place. Rename is atomic on the same
 // filesystem, so concurrent statusline processes (or goroutines) never observe a torn
-// file. The directory must already exist.
+// file. The directory must already exist. It never touches other files in the
+// directory (callers that own the directory sweep orphans via writeCacheFile).
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	sweepStaleTemps(dir)
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
@@ -319,10 +356,7 @@ func writeBudgetCache(c credential, info *KeyInfo) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
-		return
-	}
-	_ = writeFileAtomic(budgetCacheFile(c), data, 0o600)
+	writeCacheFile(budgetCacheFile(c), data)
 }
 
 // readBudgetFailCache returns a recent failed-fetch record, if one exists within
@@ -366,10 +400,7 @@ func writeBudgetFailCache(c credential, fetchErr error) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
-		return
-	}
-	_ = writeFileAtomic(budgetFailCacheFile(c), data, 0o600)
+	writeCacheFile(budgetFailCacheFile(c), data)
 }
 
 // errorFromFailEntry rebuilds an error equivalent to the original failed fetch so
@@ -416,14 +447,12 @@ func writeUpdateCache(version string) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
-		return
-	}
-	_ = writeFileAtomic(updateCacheFile(), data, 0o600)
+	writeCacheFile(updateCacheFile(), data)
 }
 
-// fetchLatestVersion calls the GitHub releases API to get the latest release tag
-func fetchLatestVersion() string {
+// fetchLatestVersion calls the GitHub releases API to get the latest release tag.
+// A var so tests can stub the network call.
+var fetchLatestVersion = func() string {
 	url := "https://api.github.com/repos/" + GitHubRepo + "/releases/latest"
 	client := &http.Client{Timeout: UpdateCheckTimeout}
 
@@ -453,15 +482,35 @@ func fetchLatestVersion() string {
 
 // getLatestVersion returns the latest GitHub release tag, using a 1-hour filesystem cache.
 // Each invocation is a fresh process, so the cache must live on disk.
+// Returns "" when update checks are disabled (dev builds, LITELLM_PLUGIN_UPDATE_CHECK=0).
 func getLatestVersion() string {
+	if !updateCheckEnabled() {
+		return ""
+	}
 	if version, ok := readUpdateCache(); ok {
 		return version
 	}
+	// Claim the slot before going to the network: if this process is killed
+	// mid-request (editors time out, Claude Code cancels in-flight runs), the
+	// next run still backs off for the full TTL instead of retrying forever.
+	writeUpdateCache("")
 	latest := fetchLatestVersion()
-	// Persist even on "" (failure / rate-limit) so the next refresh reads the cache
-	// and backs off rather than re-attempting the network call.
-	writeUpdateCache(latest)
+	if latest != "" {
+		writeUpdateCache(latest)
+	}
 	return latest
+}
+
+// updateCheckEnabled reports whether the GitHub latest-release check may run.
+func updateCheckEnabled() bool {
+	if Version == "dev" {
+		return false
+	}
+	switch strings.ToLower(os.Getenv("LITELLM_PLUGIN_UPDATE_CHECK")) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
 }
 
 // semverGreater returns true if version a is greater than version b.
@@ -519,6 +568,9 @@ type credential struct {
 	// Gateway tokens authenticate but are not DB key rows, so budgets come
 	// from /user/info instead of /key/info.
 	gateway bool
+	// source names where the token came from (env var name, credentials file,
+	// macOS Keychain) for diagnostics. Never the token itself.
+	source string
 }
 
 // gatewayPathSuffix is the path Claude Code appends to the LiteLLM issuer when
@@ -538,24 +590,50 @@ const gatewayPathSuffix = "/claude_code_gateway"
 // Claude Code's Anthropic OAuth token (claudeAiOauth) is deliberately never
 // used: it is a first-party Anthropic credential, not a LiteLLM one.
 func resolveCredential() credential {
+	c, _ := resolveCredentialWithNotes()
+	return c
+}
+
+// resolveCredentialWithNotes is resolveCredential plus human-readable, non-secret
+// notes explaining what was found and why a stored token was skipped (used by
+// `doctor`). The resolution logic and security invariants are identical.
+func resolveCredentialWithNotes() (credential, []string) {
+	var notes []string
 	baseURL := getBaseURL()
-	if tok := getEnvWithFallback("LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN"); tok != "" {
-		return credential{token: tok, baseURL: baseURL}
+	for _, name := range []string{"LITELLM_PROXY_API_KEY", "ANTHROPIC_AUTH_TOKEN"} {
+		if tok := os.Getenv(name); tok != "" {
+			return credential{token: tok, baseURL: baseURL, source: name}, notes
+		}
 	}
-	for _, read := range credentialSources() {
-		payload := read()
+	if skip := keychainSkipReason(); skip != "" {
+		notes = append(notes, skip)
+	}
+	for _, src := range credentialSources() {
+		payload := src.read()
 		if len(payload) == 0 {
 			continue
 		}
 		jwt, gatewayURL := extractGatewayToken(payload)
 		if jwt == "" {
+			notes = append(notes, src.name+": no unexpired LiteLLM gateway token (run /login in Claude Code)")
 			continue
 		}
 		if target, ok := gatewayTarget(baseURL, gatewayURL); ok {
-			return credential{token: jwt, baseURL: target, gateway: true}
+			return credential{token: jwt, baseURL: target, gateway: true, source: src.name}, notes
 		}
+		notes = append(notes, fmt.Sprintf("%s: gateway token issued by %s was withheld: base URL %q is not the same HTTPS origin",
+			src.name, redactURL(gatewayURL), baseURL))
 	}
-	return credential{baseURL: baseURL}
+	return credential{baseURL: baseURL}, notes
+}
+
+// redactURL keeps scheme, host and path of a URL for diagnostics (drops query/userinfo).
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(unparseable URL)"
+	}
+	return u.Scheme + "://" + u.Host + u.Path
 }
 
 // extractGatewayToken returns the LiteLLM gateway SSO token and the gateway URL
@@ -644,17 +722,79 @@ func expired(ms *float64) bool {
 	return ms != nil && time.Now().After(time.UnixMilli(int64(*ms)))
 }
 
+// defaultClaudeConfigDir is ~/.claude, or "" when the home dir is unknown.
+func defaultClaudeConfigDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// claudeConfigDir is Claude Code's config dir: $CLAUDE_CONFIG_DIR when set
+// (Claude Code relocates settings.json and .credentials.json there), else ~/.claude.
+func claudeConfigDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
+	}
+	return defaultClaudeConfigDir()
+}
+
+// customClaudeConfigDir reports whether CLAUDE_CONFIG_DIR points away from ~/.claude.
+func customClaudeConfigDir() bool {
+	d := os.Getenv("CLAUDE_CONFIG_DIR")
+	if d == "" {
+		return false
+	}
+	def := defaultClaudeConfigDir()
+	return def == "" || filepath.Clean(d) != filepath.Clean(def)
+}
+
+// claudeSettingsPath is the user-level Claude Code settings file.
+func claudeSettingsPath() string {
+	dir := claudeConfigDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "settings.json")
+}
+
+// credentialsFilePath returns Claude Code's credentials file.
 // LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE overrides the default location for
 // non-standard installs and tests. Returns "" when no path can be determined.
 func credentialsFilePath() string {
 	if p := os.Getenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE"); p != "" {
 		return p
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	dir := claudeConfigDir()
+	if dir == "" {
 		return ""
 	}
-	return filepath.Join(home, ".claude", ".credentials.json")
+	return filepath.Join(dir, ".credentials.json")
+}
+
+// keychainSkipReason explains why the macOS Keychain is not consulted, or ""
+// when it is (or the platform has no Keychain).
+func keychainSkipReason() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	if os.Getenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE") != "" {
+		return "macOS Keychain skipped: LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE is set"
+	}
+	if customClaudeConfigDir() {
+		// Claude Code keys a different (undocumented) Keychain entry per config
+		// dir; the default entry may belong to another account, so never read it.
+		return "macOS Keychain skipped: CLAUDE_CONFIG_DIR is set (its Keychain entry name is undocumented); " +
+			"set LITELLM_PROXY_API_KEY or LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE instead"
+	}
+	return ""
+}
+
+// credSource is one lazily-read location of Claude Code's credential store.
+type credSource struct {
+	name string
+	read func() []byte
 }
 
 // credentialSources returns lazy readers for Claude Code's credential store,
@@ -667,9 +807,11 @@ func credentialsFilePath() string {
 //     "Claude Code-credentials"): the account-anchored item first, then the
 //     accountless lookup. Claude Code stores credentials only in the Keychain
 //     on macOS, so gateway-SSO users have no credentials file.
-func credentialSources() []func() []byte {
+//
+// With CLAUDE_CONFIG_DIR pointing elsewhere, only <dir>/.credentials.json is read.
+func credentialSources() []credSource {
+	path := credentialsFilePath()
 	readFile := func() []byte {
-		path := credentialsFilePath()
 		if path == "" {
 			return nil
 		}
@@ -679,12 +821,12 @@ func credentialSources() []func() []byte {
 		}
 		return data
 	}
-	if os.Getenv("LITELLM_PLUGIN_CLAUDE_CREDENTIALS_FILE") != "" {
-		return []func() []byte{readFile}
-	}
-	sources := []func() []byte{readFile}
-	if runtime.GOOS == "darwin" {
-		sources = append(sources, keychainReadWithAccount, keychainRead)
+	sources := []credSource{{name: "credentials file " + path, read: readFile}}
+	if runtime.GOOS == "darwin" && keychainSkipReason() == "" {
+		sources = append(sources,
+			credSource{name: "macOS Keychain (" + keychainService + ")", read: func() []byte { return keychainReadWithAccount() }},
+			credSource{name: "macOS Keychain (" + keychainService + ")", read: func() []byte { return keychainRead() }},
+		)
 	}
 	return sources
 }
@@ -775,6 +917,9 @@ func getPrefix(input StatusInput) string {
 // on them with a "where.token" lookup error. Either way a /team/info call then
 // populates the team budget fields — the only budget the statusline displays.
 func budgetInfo(c credential) (*KeyInfo, error) {
+	if c.baseURL == "" {
+		return nil, ErrNoBaseURL
+	}
 	if info, ok := readBudgetCache(c); ok {
 		return info, nil
 	}
@@ -783,24 +928,7 @@ func budgetInfo(c credential) (*KeyInfo, error) {
 	if failed, ok := readBudgetFailCache(c); ok {
 		return nil, errorFromFailEntry(failed)
 	}
-	var info *KeyInfo
-	var err error
-	if c.gateway {
-		info, err = fetchUserInfo(c)
-		if err == nil {
-			enrichTeamBudget(c, info)
-			// Gateway tokens enforce the JWT-scoped team's budget; when that
-			// team is unbudgeted, the user-level budget is what gates requests.
-			if (info.TeamMaxBudget == nil || *info.TeamMaxBudget <= 0) && info.MaxBudget != nil {
-				info.TeamSpend = info.Spend
-				info.TeamMaxBudget = info.MaxBudget
-				info.TeamBudgetDuration = info.BudgetDuration
-				info.TeamBudgetResetAt = info.BudgetResetAt
-			}
-		}
-	} else {
-		info, err = fetchKeyInfoWithTeam(c)
-	}
+	info, err := fetchBudget(c)
 	if err != nil {
 		writeBudgetFailCache(c, err)
 		return nil, err
@@ -809,14 +937,45 @@ func budgetInfo(c credential) (*KeyInfo, error) {
 	return info, nil
 }
 
-// fetchKeyInfoWithTeam fetches /key/info and enriches it with the team budget
-// (the only budget the statusline displays — key-level spend is never shown).
-func fetchKeyInfoWithTeam(c credential) (*KeyInfo, error) {
-	info, err := fetchKeyInfo(c)
+// fetchBudget performs the uncached budget fetch (shared by budgetInfo and
+// `doctor`), bounded as a whole by BudgetDeadline.
+func fetchBudget(c credential) (*KeyInfo, error) {
+	if c.baseURL == "" {
+		return nil, ErrNoBaseURL
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), BudgetDeadline)
+	defer cancel()
+	if !c.gateway {
+		return fetchKeyInfoWithTeam(ctx, c)
+	}
+	info, err := fetchUserInfo(ctx, c)
 	if err != nil {
 		return nil, err
 	}
-	enrichTeamBudget(c, info)
+	if err := enrichTeamBudget(ctx, c, info); err != nil {
+		return nil, err
+	}
+	// Gateway tokens enforce the JWT-scoped team's budget; when that
+	// team is unbudgeted, the user-level budget is what gates requests.
+	if (info.TeamMaxBudget == nil || *info.TeamMaxBudget <= 0) && info.MaxBudget != nil {
+		info.TeamSpend = info.Spend
+		info.TeamMaxBudget = info.MaxBudget
+		info.TeamBudgetDuration = info.BudgetDuration
+		info.TeamBudgetResetAt = info.BudgetResetAt
+	}
+	return info, nil
+}
+
+// fetchKeyInfoWithTeam fetches /key/info and enriches it with the team budget
+// (the only budget the statusline displays — key-level spend is never shown).
+func fetchKeyInfoWithTeam(ctx context.Context, c credential) (*KeyInfo, error) {
+	info, err := fetchKeyInfo(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	if err := enrichTeamBudget(ctx, c, info); err != nil {
+		return nil, err
+	}
 	return info, nil
 }
 
@@ -824,15 +983,22 @@ func fetchKeyInfoWithTeam(c credential) (*KeyInfo, error) {
 // only budget the statusline displays; key/user-level spend is never shown.
 // Primary source is this member's own litellm_budget_table row; fallbacks are
 // team_member_budget_table, then the team's own max_budget. Spend is always
-// paired with the budget's own source — never the key's spend. Best-effort:
-// a failed call leaves info untouched.
-func enrichTeamBudget(c credential, info *KeyInfo) {
+// paired with the budget's own source — never the key's spend.
+//
+// A key that may not read its team (401/403/404) simply has no team budget.
+// Any other failure (timeout, 5xx) is returned so it surfaces as a connection
+// error and is negative-cached, instead of being cached as "no budget".
+func enrichTeamBudget(ctx context.Context, c credential, info *KeyInfo) error {
 	if info.TeamID == nil || *info.TeamID == "" {
-		return
+		return nil
 	}
-	teamResp, err := fetchTeamInfo(c, *info.TeamID)
+	teamResp, err := fetchTeamInfo(ctx, c, *info.TeamID)
 	if err != nil {
-		return
+		var hErr *httpStatusError
+		if errors.Is(err, ErrAuth) || (errors.As(err, &hErr) && hErr.Status == http.StatusNotFound) {
+			return nil
+		}
+		return err
 	}
 	ti := teamResp.TeamInfo
 	if info.UserID != nil && *info.UserID != "" {
@@ -867,6 +1033,56 @@ func enrichTeamBudget(c credential, info *KeyInfo) {
 			}
 		}
 	}
+	return nil
+}
+
+// getJSON GETs baseURL+path with the credential and decodes a 200 response into
+// out. Shared error mapping: 401/403 → ErrAuth (body omitted — LiteLLM's token
+// lookup errors can echo token-derived details), LiteLLM budget_exceeded →
+// *BudgetExceededError, other non-200 → *httpStatusError with a truncated body.
+func getJSON(ctx context.Context, c credential, path string, out any) error {
+	if c.baseURL == "" {
+		return ErrNoBaseURL
+	}
+	endpoint := c.baseURL + path
+
+	client := &http.Client{Timeout: HTTPTimeout}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("request creation failed: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "claude-code-litellm-plugin/"+Version)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connection error: %w [url=%s]", err, endpoint)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("connection error: failed to read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("status=%d url=%s: %w", resp.StatusCode, endpoint, ErrAuth)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var litellmErr liteLLMError
+		if json.Unmarshal(body, &litellmErr) == nil && litellmErr.Error.Type == "budget_exceeded" {
+			bErr := &BudgetExceededError{}
+			_, _ = fmt.Sscanf(litellmErr.Error.Message, "Budget has been exceeded! Current cost: %f, Max budget: %f", &bErr.Spend, &bErr.MaxBudget)
+			return bErr
+		}
+		return &httpStatusError{Status: resp.StatusCode, URL: endpoint, Body: truncateBody(body)}
+	}
+
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("JSON parse error: %w [body=%s]", err, truncateBody(body))
+	}
+	return nil
 }
 
 // UserInfoResponse is the /user/info response LiteLLM serves to the
@@ -911,49 +1127,10 @@ type GatewayTeam struct {
 // team on the developer's user record" (user_info.teams[0]); exact for
 // single-team users, best-effort for multi-team users, since the proxy picks
 // from a DB query without an explicit order.
-func fetchUserInfo(c credential) (*KeyInfo, error) {
-	baseURL := c.baseURL
-	if baseURL == "" {
-		return nil, fmt.Errorf("no LiteLLM proxy URL configured (set LITELLM_PROXY_URL or ANTHROPIC_BASE_URL)")
-	}
-	endpoint := baseURL + "/user/info"
-
-	client := &http.Client{Timeout: HTTPTimeout}
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("request creation failed: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("connection error: %w [url=%s]", err, endpoint)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("status=%d url=%s: %w", resp.StatusCode, endpoint, ErrAuth)
-	}
-
-	if resp.StatusCode != 200 {
-		var litellmErr liteLLMError
-		if json.Unmarshal(body, &litellmErr) == nil && litellmErr.Error.Type == "budget_exceeded" {
-			bErr := &BudgetExceededError{}
-			_, _ = fmt.Sscanf(litellmErr.Error.Message, "Budget has been exceeded! Current cost: %f, Max budget: %f", &bErr.Spend, &bErr.MaxBudget)
-			return nil, bErr
-		}
-		return nil, fmt.Errorf("HTTP error: status=%d url=%s body=%s", resp.StatusCode, endpoint, truncateBody(body))
-	}
-
+func fetchUserInfo(ctx context.Context, c credential) (*KeyInfo, error) {
 	var response UserInfoResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("JSON parse error: %w [body=%s]", err, truncateBody(body))
+	if err := getJSON(ctx, c, "/user/info", &response); err != nil {
+		return nil, err
 	}
 
 	info := &KeyInfo{
@@ -983,90 +1160,19 @@ func fetchUserInfo(c credential) (*KeyInfo, error) {
 	return info, nil
 }
 
-// fetchKeyInfo makes the actual API call
-func fetchKeyInfo(c credential) (*KeyInfo, error) {
-	baseURL := c.baseURL
-	if baseURL == "" {
-		return nil, fmt.Errorf("no LiteLLM proxy URL configured (set LITELLM_PROXY_URL or ANTHROPIC_BASE_URL)")
-	}
-	url := baseURL + "/key/info"
-
-	client := &http.Client{Timeout: HTTPTimeout}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("request creation failed: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("connection error: %w [url=%s]", err, url)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("status=%d url=%s: %w", resp.StatusCode, url, ErrAuth)
-	}
-
-	if resp.StatusCode != 200 {
-		var litellmErr liteLLMError
-		if json.Unmarshal(body, &litellmErr) == nil && litellmErr.Error.Type == "budget_exceeded" {
-			bErr := &BudgetExceededError{}
-			_, _ = fmt.Sscanf(litellmErr.Error.Message, "Budget has been exceeded! Current cost: %f, Max budget: %f", &bErr.Spend, &bErr.MaxBudget)
-			return nil, bErr
-		}
-		return nil, fmt.Errorf("HTTP error: status=%d url=%s body=%s", resp.StatusCode, url, truncateBody(body))
-	}
-
+// fetchKeyInfo fetches /key/info for a virtual key.
+func fetchKeyInfo(ctx context.Context, c credential) (*KeyInfo, error) {
 	var response KeyInfoResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("JSON parse error: %w [body=%s]", err, truncateBody(body))
+	if err := getJSON(ctx, c, "/key/info", &response); err != nil {
+		return nil, err
 	}
-
 	return &response.Info, nil
 }
 
 // fetchTeamInfo calls /team/info to get team-level budget data.
-// Returns nil, error on failure — callers treat this as best-effort.
-func fetchTeamInfo(c credential, teamID string) (*TeamInfoAPIResponse, error) {
-	baseURL := c.baseURL
-	if baseURL == "" {
-		return nil, fmt.Errorf("no LiteLLM proxy URL configured")
-	}
-	endpoint := baseURL + "/team/info?team_id=" + url.QueryEscape(teamID)
-
-	client := &http.Client{Timeout: HTTPTimeout}
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("team info HTTP error: status=%d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
+func fetchTeamInfo(ctx context.Context, c credential, teamID string) (*TeamInfoAPIResponse, error) {
 	var response TeamInfoAPIResponse
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := getJSON(ctx, c, "/team/info?team_id="+url.QueryEscape(teamID), &response); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -1312,7 +1418,7 @@ func formatStatusLine(info *KeyInfo, latestVersion string, input StatusInput) st
 
 	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
 		// No team budget resolved — key-level spend is intentionally not shown as a fallback.
-		return formatError("no budget configured", input)
+		return formatError("No budget configured", input)
 	}
 
 	budget := *info.MaxBudget
@@ -1365,9 +1471,12 @@ type StatusJSON struct {
 	ResetLabel      string  `json:"reset_label,omitempty"`
 	ResetTime       string  `json:"reset_time,omitempty"`
 	UpdateAvailable string  `json:"update_available,omitempty"`
-	ContextPercent  float64 `json:"context_percent,omitempty"`
-	HasContext      bool    `json:"has_context"`
-	Error           string  `json:"error,omitempty"`
+	// Version is the binary's own version. Editor plugins show it and treat its
+	// absence as "binary older than the plugin".
+	Version        string  `json:"version"`
+	ContextPercent float64 `json:"context_percent,omitempty"`
+	HasContext     bool    `json:"has_context"`
+	Error          string  `json:"error,omitempty"`
 }
 
 // stripANSI removes all ANSI escape sequences from s, leaving plain text.
@@ -1383,27 +1492,14 @@ func stripANSI(s string) string {
 // so the two output modes can never drift. buildStatusJSON strips the ANSI for JSON.
 func renderLine(info *KeyInfo, latestVersion string, input StatusInput, err error) string {
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrBudgetExceeded):
-			var bErr *BudgetExceededError
-			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
-				pct := (bErr.Spend / bErr.MaxBudget) * 100
-				return fmt.Sprintf("%s%s$%.2f/$%.2f (%.0f%%) | Budget exceeded%s",
-					ColorRed, getPrefix(input), bErr.Spend, bErr.MaxBudget, pct, ColorReset)
-			}
-			return formatError("Budget exceeded", input)
-		case errors.Is(err, ErrAuth):
-			return formatError("Auth error", input)
-		case strings.Contains(err.Error(), "timeout") ||
-			strings.Contains(err.Error(), "connection") ||
-			strings.Contains(err.Error(), "dial"):
-			return formatError("Connection error", input)
-		default:
-			if errors.Is(err, ErrNoAPIKey) {
-				return formatError("No API key", input)
-			}
-			return formatError("Error", input)
+		var bErr *BudgetExceededError
+		if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
+			pct := (bErr.Spend / bErr.MaxBudget) * 100
+			return fmt.Sprintf("%s%s$%.2f/$%.2f (%.0f%%) | Budget exceeded%s",
+				ColorRed, getPrefix(input), bErr.Spend, bErr.MaxBudget, pct, ColorReset)
 		}
+		text, _ := classifyError(err)
+		return formatError(text, input)
 	}
 	if info == nil {
 		return formatError("Error", input)
@@ -1411,11 +1507,34 @@ func renderLine(info *KeyInfo, latestVersion string, input StatusInput, err erro
 	return formatStatusLine(info, latestVersion, input)
 }
 
+// classifyError maps a fetch/resolution error to the short status-line text and
+// the stable lowercase code used in the --json "error" field. Both output modes
+// use it, so they can't drift.
+func classifyError(err error) (text, code string) {
+	switch {
+	case errors.Is(err, ErrBudgetExceeded):
+		return "Budget exceeded", "budget exceeded"
+	case errors.Is(err, ErrAuth):
+		return "Auth error", "auth error"
+	case errors.Is(err, ErrNoAPIKey):
+		return "No API key", "no api key"
+	case errors.Is(err, ErrNoBaseURL):
+		return "No proxy URL", "no proxy url"
+	case errors.Is(err, context.DeadlineExceeded),
+		strings.Contains(err.Error(), "timeout"),
+		strings.Contains(err.Error(), "connection"),
+		strings.Contains(err.Error(), "dial"):
+		return "Connection error", "connection error"
+	default:
+		return "Error", "error"
+	}
+}
+
 // buildStatusJSON gathers the same data as the ANSI path but returns a structured
 // StatusJSON. info may be nil (fetch failed); err carries the reason. The caller
 // decides whether to render the ANSI line or emit this struct.
 func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err error) StatusJSON {
-	out := StatusJSON{Prefix: strings.TrimSpace(getPrefix(input))}
+	out := StatusJSON{Prefix: strings.TrimSpace(getPrefix(input)), Version: Version}
 	out.Text = stripANSI(renderLine(info, latestVersion, input, err))
 
 	if input.ContextWindow != nil && input.ContextWindow.UsedPercentage != nil {
@@ -1434,27 +1553,14 @@ func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err
 	}
 
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrBudgetExceeded):
-			var bErr *BudgetExceededError
-			if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
-				out.HasBudget = true
-				out.Spend = bErr.Spend
-				out.MaxBudget = bErr.MaxBudget
-				out.Percent = (bErr.Spend / bErr.MaxBudget) * 100
-			}
-			out.Error = "budget exceeded"
-		case errors.Is(err, ErrAuth):
-			out.Error = "auth error"
-		case errors.Is(err, ErrNoAPIKey):
-			out.Error = "no api key"
-		case strings.Contains(err.Error(), "timeout") ||
-			strings.Contains(err.Error(), "connection") ||
-			strings.Contains(err.Error(), "dial"):
-			out.Error = "connection error"
-		default:
-			out.Error = "error"
+		var bErr *BudgetExceededError
+		if errors.As(err, &bErr) && bErr.MaxBudget > 0 {
+			out.HasBudget = true
+			out.Spend = bErr.Spend
+			out.MaxBudget = bErr.MaxBudget
+			out.Percent = (bErr.Spend / bErr.MaxBudget) * 100
 		}
+		_, out.Error = classifyError(err)
 		return out
 	}
 
@@ -1484,51 +1590,144 @@ func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err
 }
 
 func main() {
-	args := os.Args[1:]
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
 
-	if len(args) > 0 && (args[0] == "--version" || args[0] == "-v") {
-		fmt.Println(Version)
-		return
+const usage = `claude-code-litellm-plugin: LiteLLM budget for the Claude Code status line.
+
+Usage:
+  claude-code-litellm-plugin            render the status line (Claude Code runs this; reads its JSON on stdin)
+  claude-code-litellm-plugin --json     emit status as JSON (editor plugins); loads the env block of Claude's settings.json
+  claude-code-litellm-plugin setup      add/refresh the statusLine entry in Claude Code's settings.json (see: setup --help)
+  claude-code-litellm-plugin doctor     diagnose configuration, credentials and connectivity
+  claude-code-litellm-plugin --version  print the version
+`
+
+// run is main without the process exit, so tests can drive every mode.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	mode := ""
+	if len(args) > 0 {
+		mode = args[0]
+	}
+	switch mode {
+	case "--version", "-v", "version":
+		_, _ = fmt.Fprintln(stdout, Version)
+		return 0
+	case "--help", "-h", "help":
+		_, _ = fmt.Fprint(stdout, usage)
+		return 0
+	case "setup":
+		return runSetup(args[1:], stdout, stderr)
+	case "doctor":
+		return runDoctor(args[1:], stdout, stderr)
+	case "", "--json":
+	default:
+		_, _ = fmt.Fprintf(stderr, "unknown argument %q\n\n%s", mode, usage)
+		return 2
+	}
+	jsonMode := mode == "--json"
+
+	var input StatusInput
+	if isTerminal(stdin) {
+		// A human ran us by hand: don't block waiting for Claude Code's JSON.
+		_, _ = fmt.Fprintln(stderr, "(no status JSON on stdin: run `claude-code-litellm-plugin doctor` to diagnose, or --help)")
+	} else {
+		input = readStatusInput(stdin)
 	}
 
-	jsonMode := len(args) > 0 && args[0] == "--json"
-
-	input := readStatusInput(os.Stdin)
+	if jsonMode {
+		// Editors don't inherit the env Claude Code applies from settings.json, so
+		// apply it here — one implementation for every plugin. Never in plain mode:
+		// Claude Code already applied it there, including project-level overrides.
+		applyClaudeSettingsEnv()
+	}
 
 	cred := resolveCredential()
 	if cred.token == "" {
 		noKey := fmt.Errorf("%w", ErrNoAPIKey)
 		if jsonMode {
-			emitJSON(buildStatusJSON(nil, "", input, noKey))
-			return
+			emitJSON(stdout, buildStatusJSON(nil, "", input, noKey))
+		} else {
+			_, _ = fmt.Fprintln(stdout, renderLine(nil, "", input, noKey))
 		}
-		fmt.Println(renderLine(nil, "", input, noKey))
-		return
+		return 0
 	}
 
+	// The update check runs alongside the budget fetch so it adds no latency.
+	latestCh := make(chan string, 1)
+	go func() { latestCh <- getLatestVersion() }()
 	info, err := budgetInfo(cred)
-	latestVersion := getLatestVersion()
+	latestVersion := <-latestCh
 
 	if jsonMode {
-		emitJSON(buildStatusJSON(info, latestVersion, input, err))
-		return
+		emitJSON(stdout, buildStatusJSON(info, latestVersion, input, err))
+	} else {
+		_, _ = fmt.Fprintln(stdout, renderLine(info, latestVersion, input, err))
 	}
+	return 0
+}
 
-	if err != nil || info == nil {
-		fmt.Println(renderLine(info, latestVersion, input, err))
-		return
+// isTerminal reports whether r is an interactive terminal (character device).
+func isTerminal(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	if !ok {
+		return false
 	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
 
-	fmt.Println(renderLine(info, latestVersion, input, nil))
+// utf8BOM is stripped from settings files: Windows PowerShell 5.1 writes one.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// readClaudeSettingsEnv returns the string values of the "env" block of
+// Claude Code's user settings.json. Missing/invalid files yield nil.
+func readClaudeSettingsEnv() map[string]string {
+	path := claudeSettingsPath()
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var settings struct {
+		Env map[string]any `json:"env"`
+	}
+	if err := json.Unmarshal(bytes.TrimPrefix(data, utf8BOM), &settings); err != nil {
+		return nil
+	}
+	env := make(map[string]string, len(settings.Env))
+	for k, v := range settings.Env {
+		if s, ok := v.(string); ok && k != "" {
+			env[k] = s
+		}
+	}
+	return env
+}
+
+// applyClaudeSettingsEnv sets the settings.json env block into this process's
+// environment, overriding inherited values exactly as Claude Code does for its
+// subprocesses. Returns the keys applied, sorted.
+func applyClaudeSettingsEnv() []string {
+	env := readClaudeSettingsEnv()
+	keys := make([]string, 0, len(env))
+	for k, v := range env {
+		if os.Setenv(k, v) == nil {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // emitJSON marshals out to stdout. A failure to marshal would indicate a programming
 // error (nil pointers on the struct fields can't happen), so it panics — the binary
 // should never produce unparseable JSON in --json mode.
-func emitJSON(out StatusJSON) {
+func emitJSON(w io.Writer, out StatusJSON) {
 	data, err := json.Marshal(out)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(string(data))
+	_, _ = fmt.Fprintln(w, string(data))
 }

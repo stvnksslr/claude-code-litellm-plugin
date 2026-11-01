@@ -1,0 +1,163 @@
+name: Installer smoke test
+
+# Installs a published release (usually an rc: ./release.sh --pre=rc.1) with the
+# installers from this branch, on a throwaway home directory, and checks that
+# settings.json was merged correctly and the binary works end to end against a
+# mock LiteLLM. Run: gh workflow run installer-smoke.yml -f version=0.5.0-rc.1
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to install (e.g. 0.5.0-rc.1)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      LITELLM_PLUGIN_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fake home with existing settings
+        run: |
+          FAKE_HOME="$RUNNER_TEMP/home"
+          mkdir -p "$FAKE_HOME/.claude"
+          cat > "$FAKE_HOME/.claude/settings.json" <<'EOF'
+          {
+            "model": "opus",
+            "env": {
+              "LITELLM_PROXY_URL": "http://127.0.0.1:4000",
+              "LITELLM_PROXY_API_KEY": "sk-smoke"
+            }
+          }
+          EOF
+          echo "FAKE_HOME=$FAKE_HOME" >> "$GITHUB_ENV"
+
+      - name: Start mock LiteLLM
+        run: |
+          python3 .github/scripts/mock_litellm.py 4000 &
+          for _ in $(seq 20); do curl -s -o /dev/null http://127.0.0.1:4000/ && break; sleep 0.5; done
+
+      - name: Run install.sh the way users do (curl | bash)
+        run: cat install.sh | HOME="$FAKE_HOME" SHELL=/bin/bash bash
+
+      - name: Verify
+        env:
+          HOME: ${{ env.FAKE_HOME }}
+        run: |
+          set -euo pipefail
+          BIN="$HOME/.local/bin/claude-code-litellm-plugin"
+          S="$HOME/.claude/settings.json"
+          cat "$S"
+
+          test "$("$BIN" --version)" = "$LITELLM_PLUGIN_VERSION"
+          test "$(head -c 3 "$S" | od -An -tx1 | tr -d ' ')" != "efbbbf"          # no BOM
+          jq -e '.model == "opus" and .env.LITELLM_PROXY_API_KEY == "sk-smoke"' "$S"   # other keys kept
+          jq -e '.statusLine.type == "command" and .statusLine.refreshInterval == 30
+                 and (.statusLine.command | endswith("claude-code-litellm-plugin"))' "$S"
+          grep -q 'claude-code-litellm-plugin installer' "$HOME/.bashrc"             # PATH added
+
+          # Second run is idempotent (same file, still one PATH line).
+          before=$(shasum "$S")
+          cat install.sh | SHELL=/bin/bash bash >/dev/null
+          test "$before" = "$(shasum "$S")"
+          test "$(grep -c 'claude-code-litellm-plugin installer' "$HOME/.bashrc")" = 1
+
+          # The configured command works as Claude Code runs it: through a shell.
+          cmd=$(jq -r .statusLine.command "$S")
+          out=$(echo '{"model":{"display_name":"Opus"}}' | LITELLM_PROXY_URL=http://127.0.0.1:4000 LITELLM_PROXY_API_KEY=sk-smoke bash -c "$cmd")
+          echo "$out"
+          echo "$out" | grep -q '25%'
+
+          # Editor mode loads the settings env by itself.
+          echo '{}' | "$BIN" --json | tee /dev/stderr | jq -e '.percent == 25 and .version == env.LITELLM_PLUGIN_VERSION'
+
+          "$BIN" doctor
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh] # Windows PowerShell 5.1 and PowerShell 7
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      LITELLM_PLUGIN_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fake profile with existing settings
+        run: |
+          $fake = Join-Path $env:RUNNER_TEMP "profile"
+          New-Item -ItemType Directory -Force -Path (Join-Path $fake ".claude"), (Join-Path $fake "AppData\Local") | Out-Null
+          $settings = '{"model":"opus","env":{"LITELLM_PROXY_URL":"http://127.0.0.1:4000","LITELLM_PROXY_API_KEY":"sk-smoke"}}'
+          # Start from a BOM'd file, as written by the old install.ps1 on 5.1: setup must repair it.
+          [System.IO.File]::WriteAllText((Join-Path $fake ".claude\settings.json"), $settings, (New-Object System.Text.UTF8Encoding $true))
+          "FAKE_PROFILE=$fake" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Start mock LiteLLM
+        run: |
+          Start-Process python -ArgumentList ".github/scripts/mock_litellm.py", "4000" -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+
+      - name: Run install.ps1 the way users do (irm | iex)
+        run: |
+          # Actions prepends ErrorActionPreference=Stop; start from the interactive default.
+          $ErrorActionPreference = "Continue"
+          $env:USERPROFILE = $env:FAKE_PROFILE
+          $env:LOCALAPPDATA = Join-Path $env:FAKE_PROFILE "AppData\Local"
+          Get-Content -Raw install.ps1 | Invoke-Expression
+          # The installer must not leak its preferences into the caller's session.
+          if ($ErrorActionPreference -eq "Stop") { throw "ErrorActionPreference leaked into the session" }
+
+      - name: Verify
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:USERPROFILE = $env:FAKE_PROFILE
+          $env:LOCALAPPDATA = Join-Path $env:FAKE_PROFILE "AppData\Local"
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\claude-code-litellm-plugin"
+          $env:Path = "$dir;$env:Path"   # what a new terminal sees after the User PATH change
+          $bin = Join-Path $dir "claude-code-litellm-plugin.exe"
+          $s = Join-Path $env:FAKE_PROFILE ".claude\settings.json"
+          Get-Content -Raw $s
+
+          if ((& $bin --version) -ne $env:LITELLM_PLUGIN_VERSION) { throw "wrong version" }
+          $bytes = [System.IO.File]::ReadAllBytes($s)
+          if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw "settings.json still has a BOM" }
+          $j = Get-Content -Raw $s | ConvertFrom-Json
+          if ($j.model -ne "opus" -or $j.env.LITELLM_PROXY_API_KEY -ne "sk-smoke") { throw "existing keys lost" }
+          if ($j.statusLine.type -ne "command" -or $j.statusLine.refreshInterval -ne 30) { throw "statusLine missing" }
+          if ($j.statusLine.command -ne "claude-code-litellm-plugin") { throw "expected bare command on Windows, got $($j.statusLine.command)" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if (($userPath -split ';') -notcontains $dir) { throw "install dir not added to user PATH" }
+
+          # The configured command resolves in both shells Claude Code may run it with.
+          $cmd = $j.statusLine.command
+          $v = powershell -NoProfile -Command "$cmd --version"
+          if ("$v".Trim() -ne $env:LITELLM_PLUGIN_VERSION) { throw "via PowerShell: $v" }
+          $v = & "C:\Program Files\Git\bin\bash.exe" -c "$cmd --version"
+          if ("$v".Trim() -ne $env:LITELLM_PLUGIN_VERSION) { throw "via Git Bash: $v" }
+
+          # A real status line render, fed Claude Code's stdin JSON.
+          $env:LITELLM_PROXY_URL = "http://127.0.0.1:4000"; $env:LITELLM_PROXY_API_KEY = "sk-smoke"
+          $out = '{"model":{"display_name":"Opus"}}' | & $bin
+          Write-Host $out
+          if ("$out" -notmatch "25%") { throw "status line: $out" }
+          Remove-Item Env:LITELLM_PROXY_URL, Env:LITELLM_PROXY_API_KEY
+
+          # Editor mode loads the settings env by itself.
+          $js = ('{}' | & $bin --json) | ConvertFrom-Json
+          if ($js.percent -ne 25 -or $js.version -ne $env:LITELLM_PLUGIN_VERSION) { throw "--json: $($js | ConvertTo-Json)" }
+
+          & $bin doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed" }

@@ -5,12 +5,24 @@
   "version": "0.0.0-dev",
   "publisher": "stvnksslr",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stvnksslr/claude-code-litellm-plugin"
+  },
+  "homepage": "https://github.com/stvnksslr/claude-code-litellm-plugin#editor-plugins",
+  "bugs": {
+    "url": "https://github.com/stvnksslr/claude-code-litellm-plugin/issues"
+  },
   "private": true,
   "engines": {
     "vscode": "^1.98.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "scripts": {
     "compile": "tsc -p ./",
@@ -24,13 +36,20 @@
     "@vscode/vsce": "^3.0.0"
   },
   "contributes": {
+    "commands": [
+      {
+        "command": "claudeCodeLitellm.refresh",
+        "title": "Refresh LiteLLM budget",
+        "category": "Claude Code LiteLLM"
+      }
+    ],
     "configuration": {
       "title": "Claude Code LiteLLM",
       "properties": {
         "claudeCodeLitellm.binaryPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `claude-code-litellm-plugin` binary. If empty, the extension resolves it from `PATH`, then falls back to common install locations (`~/.local/bin`, `/usr/local/bin`)."
+          "markdownDescription": "Path to the `claude-code-litellm-plugin` binary (`~` is expanded). If empty, the extension checks the install locations used by the installer, Homebrew and Scoop (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `%LOCALAPPDATA%\\Programs\\claude-code-litellm-plugin`, `~/scoop/shims`), then `PATH`."
         },
         "claudeCodeLitellm.refreshSeconds": {
           "type": "number",

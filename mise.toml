@@ -1,49 +1,30 @@
 [tools]
-go = "1.26.1"
+go = "1.27.3"     # keep in sync with the go line in go.mod (CI checks this)
+"aqua:golangci/golangci-lint" = "2.15.0"  # must be built with Go >= the go.mod go line
+"aqua:goreleaser/goreleaser" = "2.19.0"   # release builds; CI and local use the same version
 node = "22"       # VS Code extension: npm/tsc/vsce
-java = "21"      # IntelliJ plugin: runs Gradle 8.13 wrapper + Kotlin 1.9.25
+java = "21"       # IntelliJ plugin: runs Gradle 8.13 (emits Java 17 bytecode for since-build 241)
+
+# --- Statusline binary ---------------------------------------------------------
 
 [tasks.build]
-description = "Build the statusline binary for the current platform"
-run = "go build -o claude-code-litellm-plugin ."
+description = "Build the statusline binary for the current platform (version from git describe)"
+run = 'go build -ldflags "-X main.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o claude-code-litellm-plugin .'
 
-[tasks.install]
-description = "Install the statusline binary via install.sh (downloads latest release + configures Claude)"
+[tasks."install:local"]
+description = "Install the locally built binary to ~/.local/bin and run setup"
+depends = ["build"]
+run = """
+set -e
+mkdir -p "$HOME/.local/bin"
+cp claude-code-litellm-plugin "$HOME/.local/bin/.claude-code-litellm-plugin.new"
+mv -f "$HOME/.local/bin/.claude-code-litellm-plugin.new" "$HOME/.local/bin/claude-code-litellm-plugin"
+"$HOME/.local/bin/claude-code-litellm-plugin" setup
+"""
+
+[tasks."install:release"]
+description = "Install the latest published release via install.sh (what end users run)"
 run = "bash install.sh"
-
-# --- All plugins --------------------------------------------------------------
-
-[tasks."build:all"]
-description = "Build the statusline binary and both editor plugins"
-depends = ["build", "vscode:build", "intellij:build"]
-
-[tasks."install:all"]
-description = "Install the statusline binary and both editor plugins"
-depends = ["install", "vscode:install", "intellij:install"]
-
-# --- VS Code ------------------------------------------------------------------
-
-[tasks."vscode:build"]
-description = "Compile TypeScript and package the VS Code extension into a .vsix"
-dir = "{{config_root}}/vscode-extension"
-run = "npm install && npm run compile && npm run package"
-
-[tasks."vscode:install"]
-description = "Install the built VS Code extension (.vsix) into code"
-depends = ["vscode:build"]
-run = "code --install-extension vscode-extension/claude-code-litellm-*.vsix --force"
-
-# --- IntelliJ ----------------------------------------------------------------
-
-[tasks."intellij:build"]
-description = "Build the IntelliJ plugin zip via the Gradle wrapper"
-dir = "{{config_root}}/intellij-plugin"
-run = "./gradlew buildPlugin --console=plain"
-
-[tasks."intellij:install"]
-description = "Install the built IntelliJ plugin zip (open the file picker in IntelliJ)"
-depends = ["intellij:build"]
-run = "open intellij-plugin/build/distributions/claude-code-litellm-intellij-*.zip"
 
 [tasks.fmt]
 description = "Format Go source files"
@@ -54,7 +35,7 @@ description = "Tidy go.mod and go.sum"
 run = "go mod tidy"
 
 [tasks.test]
-description = "Run tests (count=1 disables cache so examples.svg is always regenerated)"
+description = "Run tests (regenerates examples.svg, which is deterministic — commit any change)"
 run = "go test -v -count=1 ./..."
 
 [tasks.lint]
@@ -62,30 +43,56 @@ description = "Run all linters (fmt, tidy, golangci-lint)"
 depends = ["fmt", "tidy"]
 run = "golangci-lint run"
 
-[tasks."build:multi"]
-description = "Build for all CI/CD release targets (linux/darwin/windows x amd64/arm64/386)"
+# --- Editor plugins ------------------------------------------------------------
+
+[tasks."vscode:build"]
+description = "Compile TypeScript and package the VS Code extension into a .vsix"
+dir = "{{config_root}}/vscode-extension"
+run = "npm ci && npm run compile && npm run package"
+
+[tasks."vscode:install"]
+description = "Build the .vsix and install it into every detected VS Code-family editor"
+depends = ["vscode:build", "build"]
+run = "./claude-code-litellm-plugin setup --editors --vsix vscode-extension/claude-code-litellm-*.vsix"
+
+[tasks."intellij:build"]
+description = "Build the IntelliJ plugin zip via the Gradle wrapper"
+dir = "{{config_root}}/intellij-plugin"
+run = "./gradlew buildPlugin --console=plain"
+
+[tasks."intellij:run"]
+description = "Launch a sandbox IntelliJ with the plugin installed (for manual testing)"
+dir = "{{config_root}}/intellij-plugin"
+run = "./gradlew runIde --console=plain"
+
+[tasks."build:all"]
+description = "Build the statusline binary and both editor plugins"
+depends = ["build", "vscode:build", "intellij:build"]
+
+# --- Release -------------------------------------------------------------------
+
+[tasks."release:artifacts"]
+description = "Build the version-stamped .vsix and IntelliJ zip for a release (usage: mise run release:artifacts <version>)"
 run = """
-set -e
-GOOS_LIST="linux darwin windows"
-GOARCH_LIST="amd64 arm64 386"
-OUT=dist
-
-rm -rf $OUT && mkdir -p $OUT
-
-for OS in $GOOS_LIST; do
-  for ARCH in $GOARCH_LIST; do
-    # goreleaser skips darwin/386
-    if [ "$OS" = "darwin" ] && [ "$ARCH" = "386" ]; then continue; fi
-
-    EXT=""
-    if [ "$OS" = "windows" ]; then EXT=".exe"; fi
-
-    OUT_FILE="$OUT/claude-code-litellm-plugin_${OS}_${ARCH}${EXT}"
-    echo "Building $OUT_FILE..."
-    GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -o "$OUT_FILE" .
-  done
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION="${1:?usage: mise run release:artifacts <version>}"
+VERSION="${VERSION#v}"
+rm -f vscode-extension/*.vsix intellij-plugin/build/distributions/*.zip
+(cd vscode-extension && npm pkg set version="$VERSION" && npm ci && npm run compile && npm run package)
+(cd intellij-plugin && ./gradlew buildPlugin -PpluginVersion="$VERSION" --console=plain)
+for f in "vscode-extension/claude-code-litellm-$VERSION.vsix" "intellij-plugin/build/distributions/claude-code-litellm-intellij-$VERSION.zip"; do
+  [ -f "$f" ] || { echo "missing release artifact: $f" >&2; exit 1; }
+  echo "built $f"
 done
+"""
 
-echo "Done. Binaries in $OUT/:"
-ls $OUT/
+[tasks."release:snapshot"]
+description = "Dry-run the whole release locally (binaries, plugins, checksums, brew/scoop manifests) into dist/"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+mise run release:artifacts 0.0.0-snapshot
+goreleaser release --snapshot --clean
+git checkout -- vscode-extension/package.json vscode-extension/package-lock.json
 """
