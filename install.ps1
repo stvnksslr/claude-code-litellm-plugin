@@ -20,6 +20,9 @@ param(
 # the PowerShell window when run via `irm | iex`).
 & {
     $ErrorActionPreference = "Stop"
+    # setup/doctor report problems via exit codes (2 = existing statusLine kept); on
+    # pwsh 7.4+ don't let that turn into a terminating error.
+    $PSNativeCommandUseErrorActionPreference = $false
     $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is very slow with a progress bar on 5.1
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
