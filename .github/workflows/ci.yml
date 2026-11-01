@@ -86,6 +86,12 @@ jobs:
       - uses: jdx/mise-action@v5
       - name: goreleaser check
         run: goreleaser check
+      # Snapshots never run the brew/scoop publishers, so their token template is
+      # unchecked there; GoReleaser only accepts exactly '{{ .Env.NAME }}'.
+      - name: Publisher tokens are plain env references
+        run: |
+          bad=$(grep -nE '^\s*token:' .goreleaser.yaml | grep -vE "token: '\{\{ \.Env\.[A-Za-z0-9_]+ \}\}'$" || true)
+          if [ -n "$bad" ]; then echo "token must be exactly '{{ .Env.NAME }}':"; echo "$bad"; exit 1; fi
       - name: Snapshot release
         run: mise run release:snapshot
       # A real (non-snapshot) release refuses a dirty tree; snapshots don't check.
