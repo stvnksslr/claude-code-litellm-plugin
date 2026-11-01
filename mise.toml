@@ -79,6 +79,9 @@ set -euo pipefail
 VERSION="${1:?usage: mise run release:artifacts <version>}"
 VERSION="${VERSION#v}"
 rm -f vscode-extension/*.vsix intellij-plugin/build/distributions/*.zip
+# The version stamp is only for the packaged .vsix: restore the tracked files so
+# the checkout stays clean (goreleaser release refuses a dirty tree).
+trap 'git checkout -- vscode-extension/package.json vscode-extension/package-lock.json' EXIT
 (cd vscode-extension && npm pkg set version="$VERSION" && npm ci && npm run compile && npm run package)
 (cd intellij-plugin && ./gradlew buildPlugin -PpluginVersion="$VERSION" --console=plain)
 for f in "vscode-extension/claude-code-litellm-$VERSION.vsix" "intellij-plugin/build/distributions/claude-code-litellm-intellij-$VERSION.zip"; do
@@ -94,5 +97,4 @@ run = """
 set -euo pipefail
 mise run release:artifacts 0.0.0-snapshot
 goreleaser release --snapshot --clean
-git checkout -- vscode-extension/package.json vscode-extension/package-lock.json
 """
