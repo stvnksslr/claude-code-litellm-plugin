@@ -131,6 +131,7 @@ ensure_path() {
     if [ -f "$rc" ] && grep -qF "$marker" "$rc"; then
         return
     fi
+    # shellcheck disable=SC2016 # $PATH must stay literal: it expands when the rc file is sourced
     printf '\n%s\nexport PATH="$PATH:%s"\n' "$marker" "$INSTALL_DIR" >> "$rc"
     info "Added ${INSTALL_DIR} to PATH in ${rc} (open a new terminal to use it)"
 }

@@ -1,11 +1,10 @@
-# This is an example .goreleaser.yml file with some sensible defaults.
-# Make sure to check the documentation at https://goreleaser.com
-
-# The lines below are called `modelines`. See `:help modeline`
-# Feel free to remove those if you don't want/need to use them.
 # yaml-language-server: $schema=https://goreleaser.com/static/schema.json
-# vim: set ts=2 sw=2 tw=0 fo=cnqoj
-
+# Release flow: release.sh pushes a tag -> .github/workflows/release.yml runs the
+# tests, builds the editor plugins (mise run release:artifacts) and then
+# `goreleaser release`. GoReleaser creates the GitHub release as a draft, uploads
+# every asset (binaries, .vsix, IntelliJ zip, checksums), publishes it, and only
+# then updates the Homebrew tap and Scoop bucket — so "latest" never points at a
+# release with missing assets. Dry run: `mise run release:snapshot`.
 version: 2
 
 before:
@@ -16,7 +15,7 @@ builds:
   - env:
       - CGO_ENABLED=0
     ldflags:
-      - -X main.Version={{.Version}}
+      - -s -w -X main.Version={{.Version}}
     goos:
       - linux
       - windows
@@ -31,21 +30,65 @@ archives:
       {{- else if eq .Arch "386" }}i386
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
-    # use zip for windows archives
     format_overrides:
       - goos: windows
         formats: [zip]
 
-changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+checksum:
+  # Cover the editor plugins too: `setup --editors` verifies the .vsix against this file.
+  extra_files:
+    - glob: ./vscode-extension/claude-code-litellm-*.vsix
+    - glob: ./intellij-plugin/build/distributions/claude-code-litellm-intellij-*.zip
 
 release:
+  prerelease: auto # tags like 0.5.0-rc.1 never become "latest"
+  extra_files:
+    - glob: ./vscode-extension/claude-code-litellm-*.vsix
+    - glob: ./intellij-plugin/build/distributions/claude-code-litellm-intellij-*.zip
   footer: >-
 
     ---
 
-    Released by [GoReleaser](https://github.com/goreleaser/goreleaser).
+    Install: `curl -fsSL https://raw.githubusercontent.com/stvnksslr/claude-code-litellm-plugin/main/install.sh | bash`
+    · `brew install stvnksslr/tap/claude-code-litellm-plugin`
+    · Windows: `irm https://raw.githubusercontent.com/stvnksslr/claude-code-litellm-plugin/main/install.ps1 | iex`
+
+changelog:
+  use: github-native
+
+homebrew_casks:
+  - name: claude-code-litellm-plugin
+    binaries: [claude-code-litellm-plugin]
+    homepage: https://github.com/stvnksslr/claude-code-litellm-plugin
+    description: LiteLLM budget in the Claude Code status line
+    license: MIT
+    repository:
+      owner: stvnksslr
+      name: homebrew-tap
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+    # Without the token (forks, local runs) skip; "auto" also skips prereleases.
+    skip_upload: '{{ if isEnvSet "HOMEBREW_TAP_TOKEN" }}auto{{ else }}true{{ end }}'
+    hooks:
+      post:
+        # The binary isn't notarized; casks are quarantined on download.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/claude-code-litellm-plugin"]
+          end
+    caveats: |
+      Run `claude-code-litellm-plugin setup` to add the status line to Claude Code
+      (`setup --editors` also installs the VS Code extension), then
+      `claude-code-litellm-plugin doctor` to check the configuration.
+
+scoops:
+  - name: claude-code-litellm-plugin
+    homepage: https://github.com/stvnksslr/claude-code-litellm-plugin
+    description: LiteLLM budget in the Claude Code status line
+    license: MIT
+    repository:
+      owner: stvnksslr
+      name: scoop-bucket
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+    skip_upload: '{{ if isEnvSet "HOMEBREW_TAP_TOKEN" }}auto{{ else }}true{{ end }}'
+    post_install:
+      - Write-Host "Run 'claude-code-litellm-plugin setup' to add the status line to Claude Code ('setup --editors' also installs the VS Code extension)."

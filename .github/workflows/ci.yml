@@ -11,12 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Same toolchain source as the release job (mise.toml), so CI tests
       # exactly what GoReleaser ships. Also installs the pinned golangci-lint.
       - name: mise install
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v5
 
       - name: Go version pins agree
         run: |
@@ -48,33 +48,45 @@ jobs:
         run: golangci-lint run
 
       - name: go test
-        run: go test -v ./...
+        run: go test -v -count=1 ./...
 
-  vscode:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: mise install
-        uses: jdx/mise-action@v2
-
-      - name: Install and build VS Code extension
-        working-directory: vscode-extension
+      - name: examples.svg is up to date
         run: |
-          npm ci
-          npm run compile
-          npm run package
+          if ! git diff --exit-code examples.svg; then
+            echo "examples.svg changed: run 'mise run test' and commit it"
+            exit 1
+          fi
 
-  intellij:
+      - name: Installer scripts
+        run: |
+          bash -n install.sh
+          shellcheck install.sh release.sh
+
+  # The binary has macOS (Keychain) and Windows (paths, PATH lookup) code paths.
+  test-other-os:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Windows was never exercised in CI before; don't block merges on it until it's green once.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: go
+      - run: go test -count=1 ./...
+
+  # Builds everything a release would (binaries, .vsix, IntelliJ zip, checksums,
+  # brew/scoop manifests) without publishing, so release breakage shows up here.
+  release-dry-run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: mise install
-        uses: jdx/mise-action@v2
-
-      - name: Build IntelliJ plugin
-        working-directory: intellij-plugin
-        run: ./gradlew buildPlugin --console=plain
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v5
+      - name: goreleaser check
+        run: goreleaser check
+      - name: Snapshot release
+        run: mise run release:snapshot
