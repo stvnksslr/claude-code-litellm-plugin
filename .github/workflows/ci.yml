@@ -68,8 +68,6 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows was never exercised in CI before; don't block merges on it until it's green once.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
