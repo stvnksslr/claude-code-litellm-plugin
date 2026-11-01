@@ -65,7 +65,7 @@ homebrew_casks:
     repository:
       owner: stvnksslr
       name: homebrew-tap
-      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+      token: '{{ .Env.HOMEBREW_TAP_TOKEN }}'
     # Without the token (forks, local runs) skip; "auto" also skips prereleases.
     skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}auto{{ else }}true{{ end }}'
     hooks:
@@ -88,7 +88,7 @@ scoops:
     repository:
       owner: stvnksslr
       name: scoop-bucket
-      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+      token: '{{ .Env.HOMEBREW_TAP_TOKEN }}'
     skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}auto{{ else }}true{{ end }}'
     post_install:
       - Write-Host "Run 'claude-code-litellm-plugin setup' to add the status line to Claude Code ('setup --editors' also installs the VS Code extension)."
