@@ -189,8 +189,11 @@ If the statusline shows an error:
 - `No API key` - Set either `ANTHROPIC_AUTH_TOKEN` or `LITELLM_PROXY_API_KEY`, or sign in to Claude Code through a LiteLLM gateway (`/login`). With gateway SSO, also check the token hasn't expired and that `LITELLM_PROXY_URL` / `ANTHROPIC_BASE_URL` (if set) points at the same HTTPS host as the gateway
 - `no budget configured` - Your LiteLLM user (or the gateway token's scoped team) has no `max_budget`; set one in LiteLLM to see budget info
 - `Auth error` - Check your API key is valid; with gateway SSO the token may have lapsed — run `/login` in Claude Code again
-- `Connection error` - Check your base URL and network connection
+- `Connection error` - Check your base URL and network connection. Since Go 1.27 a TLS failure can also come from the gateway itself:
+  - Its certificate lists an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as an IP SAN, or its CA has such an IP name constraint. Go now rejects these certificates outright and there is no opt-out; reissue the certificate with a plain IPv4 address (`IP:127.0.0.1`)
+  - It only offers TLS 1.2 RSA-key-exchange (`TLS_RSA_*`) or 3DES cipher suites. The old `GODEBUG=tlsrsakex=1` / `tls3des=1` workarounds no longer exist; enable an ECDHE suite on the gateway or its TLS terminator
 - `Error` - Generic error, check logs for details
+- Statusline is blank and running `claude-code-litellm-plugin --version` prints `fatal error: removed GODEBUG "..." set to old value "..." in environment` - Your environment (shell profile or the `env` block in Claude Code settings) sets a `GODEBUG` option that Go 1.27 removed, e.g. `x509sha1=1`, `tlsrsakex=1`, `tls3des=1` or `asynctimerchan=1`. Remove that entry from `GODEBUG`; release binaries from Go 1.27 onward refuse to start with it set
 
 ## Development
 

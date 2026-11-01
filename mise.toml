@@ -1,5 +1,6 @@
 [tools]
-go = "1.26.1"
+go = "1.27.3"     # keep in sync with the go line in go.mod (CI checks this)
+"aqua:golangci/golangci-lint" = "2.15.0"  # must be built with Go >= the go.mod go line
 node = "22"       # VS Code extension: npm/tsc/vsce
 java = "21"      # IntelliJ plugin: runs Gradle 8.13 wrapper + Kotlin 1.9.25
 

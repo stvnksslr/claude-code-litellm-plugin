@@ -5,26 +5,26 @@ repos:
         name: go fmt
         entry: mise run fmt
         language: system
-        types: [go]
+        types_or: [go, go-mod]
         pass_filenames: false
 
       - id: go-mod-tidy
         name: go mod tidy
         entry: mise run tidy
         language: system
-        types: [go]
+        types_or: [go, go-mod]
         pass_filenames: false
 
       - id: golangci-lint
         name: golangci-lint
         entry: mise run lint
         language: system
-        types: [go]
+        types_or: [go, go-mod]
         pass_filenames: false
 
       - id: go-test
         name: go test
         entry: mise run test
         language: system
-        types: [go]
+        types_or: [go, go-mod]
         pass_filenames: false

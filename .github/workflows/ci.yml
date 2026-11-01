@@ -13,10 +13,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      # Same toolchain source as the release job (mise.toml), so CI tests
+      # exactly what GoReleaser ships. Also installs the pinned golangci-lint.
+      - name: mise install
+        uses: jdx/mise-action@v2
+
+      - name: Go version pins agree
+        run: |
+          MOD=$(awk '$1 == "go" { print $2 }' go.mod)
+          MISE=$(mise current go)
+          if [ "$MOD" != "$MISE" ]; then
+            echo "go.mod go line ($MOD) != mise.toml go ($MISE); update both"
+            exit 1
+          fi
 
       - name: go fmt
         run: |
@@ -36,9 +45,7 @@ jobs:
           fi
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: latest
+        run: golangci-lint run
 
       - name: go test
         run: go test -v ./...

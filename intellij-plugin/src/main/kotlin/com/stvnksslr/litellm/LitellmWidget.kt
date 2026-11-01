@@ -12,7 +12,6 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 // ---- Binary resolution + env (mirrors the VS Code extension) ----------------
-
 private fun resolveBinary(): String {
     val candidates = if (SystemInfo.isWindows) {
         val localAppData = System.getenv("LOCALAPPDATA")
