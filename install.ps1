@@ -1,144 +1,109 @@
 #Requires -Version 5.1
-$ErrorActionPreference = "Stop"
+# Installs claude-code-litellm-plugin and wires it into Claude Code.
+#
+#   irm https://raw.githubusercontent.com/stvnksslr/claude-code-litellm-plugin/main/install.ps1 | iex
+#
+# Also install the VS Code extension into detected editors:
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/stvnksslr/claude-code-litellm-plugin/main/install.ps1))) -Editors
+#
+# Environment overrides: LITELLM_PLUGIN_EDITORS=1, LITELLM_PLUGIN_VERSION=X.Y.Z,
+# LITELLM_PLUGIN_INSTALL_DIR=<dir>, LITELLM_PLUGIN_NO_MODIFY_PATH=1
+param(
+    [switch]$Editors,
+    [string]$Version = $env:LITELLM_PLUGIN_VERSION,
+    [string]$InstallDir = $env:LITELLM_PLUGIN_INSTALL_DIR,
+    [switch]$NoModifyPath
+)
 
-$Repo = "stvnksslr/claude-code-litellm-plugin"
-$BinaryName = "claude-code-litellm-plugin"
-$InstallDir = "$env:LOCALAPPDATA\Programs\$BinaryName"
+# Everything runs inside a script block so preferences don't leak into the
+# caller's session, and failures `throw` instead of `exit` (which would close
+# the PowerShell window when run via `irm | iex`).
+& {
+    $ErrorActionPreference = "Stop"
+    $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is very slow with a progress bar on 5.1
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-function Write-Info { param($Message) Write-Host "[INFO] $Message" -ForegroundColor Green }
-function Write-Warn { param($Message) Write-Host "[WARN] $Message" -ForegroundColor Yellow }
-function Write-Error { param($Message) Write-Host "[ERROR] $Message" -ForegroundColor Red; exit 1 }
+    $Repo = "stvnksslr/claude-code-litellm-plugin"
+    $BinaryName = "claude-code-litellm-plugin"
+    if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\$BinaryName" }
+    if (-not $Editors -and $env:LITELLM_PLUGIN_EDITORS) { $Editors = $true }
+    if (-not $NoModifyPath -and $env:LITELLM_PLUGIN_NO_MODIFY_PATH) { $NoModifyPath = $true }
 
-function Get-Architecture {
-    switch ($env:PROCESSOR_ARCHITECTURE) {
-        "AMD64" { return "x86_64" }
-        "ARM64" { return "arm64" }
-        "x86"   { return "i386" }
-        default { Write-Error "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE" }
+    function Write-Info($Message) { Write-Host "[INFO] $Message" -ForegroundColor Green }
+    function Write-Warn($Message) { Write-Host "[WARN] $Message" -ForegroundColor Yellow }
+
+    $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+        "AMD64" { "x86_64" }
+        "ARM64" { "arm64" }
+        "x86"   { "i386" }
+        default { throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE" }
     }
-}
 
-function Get-LatestVersion {
-    try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
-        return $release.tag_name
-    } catch {
-        Write-Error "Failed to fetch latest release version: $_"
-    }
-}
-
-function Install-Binary {
-    param (
-        [string]$Arch,
-        [string]$Version
-    )
-
-    $archiveName = "${BinaryName}_Windows_${Arch}.zip"
-    $downloadUrl = "https://github.com/$Repo/releases/download/$Version/$archiveName"
-
-    Write-Info "Downloading $archiveName..."
-
-    $tempDir = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString()))
-    $archivePath = Join-Path $tempDir $archiveName
-
-    try {
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing
-
-        Write-Info "Extracting archive..."
-        Expand-Archive -Path $archivePath -DestinationPath $tempDir -Force
-
-        # Create install directory
-        if (-not (Test-Path $InstallDir)) {
-            New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    if (-not $Version) {
+        try {
+            $Version = (Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing).tag_name
+        } catch {
+            throw "Could not determine the latest release from GitHub: $_"
         }
+    }
 
-        # Install binary
-        $binaryPath = Join-Path $tempDir "$BinaryName.exe"
-        Copy-Item -Path $binaryPath -Destination (Join-Path $InstallDir "$BinaryName.exe") -Force
+    Write-Info "Installing $BinaryName $Version for Windows $arch"
 
-        Write-Info "Installed $BinaryName to $InstallDir"
+    $archive = "${BinaryName}_Windows_${arch}.zip"
+    $checksums = "${BinaryName}_${Version}_checksums.txt"
+    $base = "https://github.com/$Repo/releases/download/$Version"
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Path $tempDir | Out-Null
+
+    try {
+        Write-Info "Downloading $archive..."
+        Invoke-WebRequest -Uri "$base/$archive" -OutFile (Join-Path $tempDir $archive) -UseBasicParsing
+        Invoke-WebRequest -Uri "$base/$checksums" -OutFile (Join-Path $tempDir $checksums) -UseBasicParsing
+
+        $want = Get-Content (Join-Path $tempDir $checksums) |
+            ForEach-Object { $parts = $_ -split '\s+'; if ($parts.Count -ge 2 -and $parts[1].TrimStart('*') -eq $archive) { $parts[0] } } |
+            Select-Object -First 1
+        if (-not $want) { throw "$archive is not listed in $checksums" }
+        $got = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $tempDir $archive)).Hash
+        if ($got.ToLower() -ne $want.ToLower()) { throw "Checksum mismatch for $archive (expected $want, got $got)" }
+        Write-Info "Checksum verified"
+
+        Expand-Archive -Path (Join-Path $tempDir $archive) -DestinationPath $tempDir -Force
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        $bin = Join-Path $InstallDir "$BinaryName.exe"
+        Copy-Item -Path (Join-Path $tempDir "$BinaryName.exe") -Destination $bin -Force
+        Write-Info "Installed $bin"
     } finally {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-}
 
-function Add-ToPath {
-    $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-
-    if ($currentPath -notlike "*$InstallDir*") {
-        $newPath = "$currentPath;$InstallDir"
-        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        $env:Path = "$env:Path;$InstallDir"
-        Write-Info "Added $InstallDir to user PATH"
-        Write-Warn "You may need to restart your terminal for PATH changes to take effect"
-    } else {
-        Write-Info "$InstallDir is already in PATH"
-    }
-}
-
-function Set-ClaudeSettings {
-    $claudeDir = Join-Path $env:USERPROFILE ".claude"
-    $settingsFile = Join-Path $claudeDir "settings.json"
-
-    if (-not (Test-Path $claudeDir)) {
-        New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
-    }
-
-    $statusLineConfig = @{
-        type = "command"
-        command = "claude-code-litellm-plugin"
-    }
-
-    if (Test-Path $settingsFile) {
-        try {
-            $settings = Get-Content $settingsFile -Raw | ConvertFrom-Json
-            $settings | Add-Member -NotePropertyName "statusLine" -NotePropertyValue $statusLineConfig -Force
-            $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsFile -Encoding UTF8
-            Write-Info "Updated Claude settings in $settingsFile"
-        } catch {
-            Write-Warn "Failed to parse existing settings. Creating backup and new file."
-            Copy-Item $settingsFile "$settingsFile.bak"
-            $newSettings = @{ statusLine = $statusLineConfig }
-            $newSettings | ConvertTo-Json -Depth 10 | Set-Content $settingsFile -Encoding UTF8
+    # PATH: lets `setup` write the bare command name (portable across Git Bash and
+    # PowerShell, which Claude Code uses to run the status line).
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $entries = @($userPath -split ';' | Where-Object { $_ })
+    if ($entries -notcontains $InstallDir) {
+        if ($NoModifyPath) {
+            Write-Warn "$InstallDir is not on your PATH"
+        } else {
+            [Environment]::SetEnvironmentVariable("Path", (($entries + $InstallDir) -join ';'), "User")
+            Write-Info "Added $InstallDir to your user PATH (new terminals pick it up)"
         }
-    } else {
-        $settings = @{ statusLine = $statusLineConfig }
-        $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsFile -Encoding UTF8
-        Write-Info "Created Claude settings at $settingsFile"
     }
-}
-
-function Main {
-    Write-Info "Installing $BinaryName..."
-
-    $arch = Get-Architecture
-    $version = Get-LatestVersion
-
-    Write-Info "Detected: Windows $arch"
-    Write-Info "Latest version: $version"
-
-    Install-Binary -Arch $arch -Version $version
-    Add-ToPath
-    Set-ClaudeSettings
+    if (($env:Path -split ';') -notcontains $InstallDir -and -not $NoModifyPath) {
+        $env:Path = "$env:Path;$InstallDir"
+    }
 
     Write-Host ""
-    Write-Info "Installation complete!"
-
-    # Check if required env vars are set
-    $missingVars = @()
-    if (-not $env:ANTHROPIC_BASE_URL -and -not $env:LITELLM_PROXY_URL) {
-        $missingVars += "ANTHROPIC_BASE_URL or LITELLM_PROXY_URL"
-    }
-    if (-not $env:ANTHROPIC_AUTH_TOKEN -and -not $env:LITELLM_PROXY_API_KEY) {
-        $missingVars += "ANTHROPIC_AUTH_TOKEN or LITELLM_PROXY_API_KEY"
+    $setupArgs = @("setup")
+    if ($Editors) { $setupArgs += "--editors" }
+    & $bin @setupArgs
+    switch ($LASTEXITCODE) {
+        0 { }
+        2 { Write-Warn "Your existing statusLine was kept. To switch to this plugin: $BinaryName setup --force" }
+        default { Write-Warn "setup did not complete; fix the issue above and run: $BinaryName setup" }
     }
 
-    if ($missingVars.Count -gt 0) {
-        Write-Warn "Missing environment variables:"
-        foreach ($var in $missingVars) {
-            Write-Warn "  - $var"
-        }
-    }
+    Write-Host ""
+    Write-Info "Checking your configuration ($BinaryName doctor):"
+    & $bin doctor
 }
-
-Main
