@@ -88,3 +88,9 @@ jobs:
         run: goreleaser check
       - name: Snapshot release
         run: mise run release:snapshot
+      # A real (non-snapshot) release refuses a dirty tree; snapshots don't check.
+      - name: Release build leaves the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "release:artifacts/goreleaser modified tracked files:"; git status --porcelain; exit 1
+          fi
