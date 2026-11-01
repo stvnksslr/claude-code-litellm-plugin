@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -371,7 +372,7 @@ func TestFormatStatusLine(t *testing.T) {
 				TeamMaxBudget: nil,
 			},
 			expectColor:       ColorRed,
-			expectContains:    []string{"no budget configured"},
+			expectContains:    []string{"No budget configured"},
 			expectNotContains: []string{"$"},
 		},
 		{
@@ -819,7 +820,7 @@ func TestFetchKeyInfoEmptyBaseURL(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", "")
 
-	_, err := fetchKeyInfo(keyCred("some-token"))
+	_, err := fetchKeyInfo(context.Background(), keyCred("some-token"))
 	if err == nil {
 		t.Fatal("expected error for empty baseURL, got nil")
 	}
@@ -1229,7 +1230,7 @@ func TestFetchTeamInfo(t *testing.T) {
 	t.Setenv("LITELLM_PROXY_URL", "")
 	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
 
-	data, err := fetchTeamInfo(keyCred("test-token"), "team-123")
+	data, err := fetchTeamInfo(context.Background(), keyCred("test-token"), "team-123")
 	if err != nil {
 		t.Fatalf("fetchTeamInfo() error = %v", err)
 	}
@@ -1461,7 +1462,7 @@ func TestZeroBudgetDivision(t *testing.T) {
 	// Should not panic on zero budget; a zero team budget reads as "no budget".
 	result := formatStatusLine(info, "", StatusInput{})
 
-	if !strings.Contains(result, "no budget configured") {
+	if !strings.Contains(result, "No budget configured") {
 		t.Errorf("expected no-budget message for zero budget, got %q", result)
 	}
 }
@@ -2256,7 +2257,7 @@ func TestCacheKeyNamespacingCredential(t *testing.T) {
 func TestErrorBodiesRedacted(t *testing.T) {
 	t.Run("auth error omits body", func(t *testing.T) {
 		userInfoServer(t, 401, `{"error":{"message":"token sk-leaky not found"}}`)
-		_, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		_, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if !errors.Is(err, ErrAuth) || strings.Contains(err.Error(), "sk-leaky") {
 			t.Errorf("fetchUserInfo() error = %v, want ErrAuth without body", err)
 		}
@@ -2264,7 +2265,7 @@ func TestErrorBodiesRedacted(t *testing.T) {
 
 	t.Run("other errors truncate body", func(t *testing.T) {
 		userInfoServer(t, 500, strings.Repeat("x", 5000))
-		_, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		_, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err == nil || len(err.Error()) > 500 || !strings.Contains(err.Error(), "truncated") {
 			t.Errorf("fetchUserInfo() error length = %d, want truncated body", len(fmt.Sprint(err)))
 		}
@@ -2290,7 +2291,7 @@ func userInfoServer(t *testing.T, status int, body string) *httptest.Server {
 func TestFetchUserInfo(t *testing.T) {
 	t.Run("team budget preferred over user fields", func(t *testing.T) {
 		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"teams":["team-1"],"spend":12.5,"max_budget":100,"budget_duration":"1d","budget_reset_at":"2026-10-01T00:00:00Z"},"teams":[{"team_id":"team-1","team_alias":"Platform","spend":80.25,"max_budget":500,"budget_duration":"1mo","budget_reset_at":"2026-10-31T00:00:00Z"}]}`)
-		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		info, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err != nil {
 			t.Fatalf("fetchUserInfo() error = %v", err)
 		}
@@ -2310,7 +2311,7 @@ func TestFetchUserInfo(t *testing.T) {
 
 	t.Run("user budget used when scoped team has none", func(t *testing.T) {
 		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"teams":["team-1"],"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","spend":80.25,"max_budget":null}]}`)
-		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		info, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err != nil {
 			t.Fatalf("fetchUserInfo() error = %v", err)
 		}
@@ -2327,7 +2328,7 @@ func TestFetchUserInfo(t *testing.T) {
 	// user_info.teams, not teams[0].
 	t.Run("scoped team comes from user_info.teams, not teams[0]", func(t *testing.T) {
 		userInfoServer(t, 200, `{"user_id":"admin-1","user_info":{"teams":["team-mine"]},"teams":[{"team_id":"team-other","max_budget":999},{"team_id":"team-mine","max_budget":50,"spend":5}]}`)
-		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		info, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err != nil {
 			t.Fatalf("fetchUserInfo() error = %v", err)
 		}
@@ -2341,7 +2342,7 @@ func TestFetchUserInfo(t *testing.T) {
 
 	t.Run("no teams on user record leaves team unset", func(t *testing.T) {
 		userInfoServer(t, 200, `{"user_id":"user-1","user_info":{"teams":[],"max_budget":100},"teams":[{"team_id":"team-other","max_budget":999}]}`)
-		info, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		info, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err != nil {
 			t.Fatalf("fetchUserInfo() error = %v", err)
 		}
@@ -2352,7 +2353,7 @@ func TestFetchUserInfo(t *testing.T) {
 
 	t.Run("401 maps to ErrAuth", func(t *testing.T) {
 		userInfoServer(t, 401, `{"error":"unauthorized"}`)
-		_, err := fetchUserInfo(gatewayCred("expired-token"))
+		_, err := fetchUserInfo(context.Background(), gatewayCred("expired-token"))
 		if !errors.Is(err, ErrAuth) {
 			t.Errorf("fetchUserInfo() error = %v, want ErrAuth", err)
 		}
@@ -2360,7 +2361,7 @@ func TestFetchUserInfo(t *testing.T) {
 
 	t.Run("non-200 surfaces HTTP error", func(t *testing.T) {
 		userInfoServer(t, 500, `{"error":{"message":"boom"}}`)
-		_, err := fetchUserInfo(gatewayCred("gw-jwt"))
+		_, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err == nil || !strings.Contains(err.Error(), "HTTP error: status=500") {
 			t.Errorf("fetchUserInfo() error = %v, want HTTP error: status=500", err)
 		}
