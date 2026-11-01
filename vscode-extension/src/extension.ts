@@ -18,180 +18,179 @@ interface StatusJSON {
   context_percent?: number;
   has_context?: boolean;
   error?: string;
+  /** Binary version; absent on binaries older than this extension. */
+  version?: string;
+}
+
+const BINARY = "claude-code-litellm-plugin";
+/** Same as the IntelliJ plugin. The binary bounds its own network work to ~4s. */
+const TIMEOUT_MS = 10_000;
+const INSTALL_HINT =
+  "Install it with the one-line installer (see the claude-code-litellm-plugin README), " +
+  "or set claudeCodeLitellm.binaryPath.";
+
+/** Expand a leading `~` the way users expect in settings. */
+function expandHome(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(os.homedir(), p.slice(2));
+  return p;
 }
 
 /**
- * Read the `env` block from Claude Code's settings file (~/.claude/settings.json).
- * This is where users configure ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN etc. for
- * the terminal CLI. The VS Code extension host never sees these — GUI apps inherit
- * env from launchd, not the shell profile — so we read the file directly and pass
- * the values to the spawned binary. Returns {} on missing/unreadable/invalid.
- */
-function readClaudeSettingsEnv(): Record<string, string> {
-  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
-  try {
-    const raw = fs.readFileSync(settingsPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.env === "object" && parsed.env !== null) {
-      return parsed.env as Record<string, string>;
-    }
-  } catch {
-    // Missing/unreadable/invalid — not fatal, extension settings or process env may suffice.
-  }
-  return {};
-}
-
-/**
- * Resolve the binary path: explicit setting → PATH → common install dirs.
- * Returns the bare binary name when no explicit path is set so spawn() can
- * resolve it via PATH; returns an absolute path only when falling back to
- * a known install location.
+ * Resolve the binary: explicit setting → known install locations (installer,
+ * Homebrew, Scoop) → bare name for PATH lookup. The IntelliJ plugin uses the
+ * same list. Settings-env merging lives in the binary (`--json` applies the
+ * `env` block of Claude Code's settings.json), so nothing else is needed here.
  */
 function resolveBinary(): string {
-  const cfg = vscode.workspace.getConfiguration("claudeCodeLitellm");
-  const explicit = cfg.get<string>("binaryPath");
-  if (explicit) return explicit;
+  const explicit = vscode.workspace.getConfiguration("claudeCodeLitellm").get<string>("binaryPath");
+  if (explicit) return expandHome(explicit);
 
-  // Fall back to common install locations so the extension works even when the
-  // binary isn't on PATH (e.g. installed via the repo's install scripts).
+  const home = os.homedir();
   const candidates: string[] = [];
   if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA;
-    if (localAppData) {
-      candidates.push(path.join(localAppData, "Programs", "claude-code-litellm-plugin", "claude-code-litellm-plugin.exe"));
-    }
+    const localAppData = process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local");
+    candidates.push(path.join(localAppData, "Programs", BINARY, `${BINARY}.exe`));
+    candidates.push(path.join(home, "scoop", "shims", `${BINARY}.exe`));
   } else {
-    candidates.push(path.join(os.homedir(), ".local", "bin", "claude-code-litellm-plugin"));
-    candidates.push("/usr/local/bin/claude-code-litellm-plugin");
+    candidates.push(path.join(home, ".local", "bin", BINARY));
+    candidates.push(`/opt/homebrew/bin/${BINARY}`);
+    candidates.push(`/usr/local/bin/${BINARY}`);
+    candidates.push(`/home/linuxbrew/.linuxbrew/bin/${BINARY}`);
   }
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
-  }
-  // Last resort: let the shell resolve it via PATH (spawn will fail visibly if absent).
-  return "claude-code-litellm-plugin";
+  return candidates.find((c) => fs.existsSync(c)) ?? BINARY;
 }
 
 /**
- * Build the env for the spawned binary. The binary is the single source of
- * truth — it reads LITELLM_PROXY_URL / LITELLM_PROXY_API_KEY / LITELLM_PLUGIN_*
- * from its own env. We merge ~/.claude/settings.json `env` (where users
- * configure these for the terminal CLI) over process.env so the extension
- * behaves identically to the statusline.
+ * Status bar background: VS Code only offers themed error/warning backgrounds,
+ * so ≥90% → error, 75–89% → warning, otherwise none. Errors use error.
  */
-function buildEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, ...readClaudeSettingsEnv() };
-}
-
-/**
- * Pick the statusbar background color. VS Code only allows two themed backgrounds
- * (error + warning) — we use red for ≥90%, yellow for 75–89%, and default (no
- * background) below that.
- */
-function backgroundColor(
-  percent: number,
-  hasBudget: boolean
-): vscode.ThemeColor | undefined {
-  if (!hasBudget) return new vscode.ThemeColor("statusBarItem.errorBackground");
-  if (percent >= 90) return new vscode.ThemeColor("statusBarItem.errorBackground");
+function backgroundColor(s: StatusJSON): vscode.ThemeColor | undefined {
+  const percent = s.percent ?? 0;
+  if (!s.has_budget || percent >= 90) return new vscode.ThemeColor("statusBarItem.errorBackground");
   if (percent >= 75) return new vscode.ThemeColor("statusBarItem.warningBackground");
   return undefined;
 }
 
-/** Build the hover tooltip (plain text, no ANSI). */
-function formatTooltip(s: StatusJSON): string {
+/** Hover tooltip (plain text). Kept in sync with the IntelliJ widget. */
+function formatTooltip(s: StatusJSON, binary: string): string {
   const lines: string[] = [];
-
-  if (s.error) {
-    lines.push(`Status: ${s.error}`);
-    if (s.has_budget && s.spend != null && s.max_budget != null) {
-      lines.push(`Spend: $${s.spend.toFixed(2)} / $${s.max_budget.toFixed(2)}`);
-    }
-    return lines.join("\n");
-  }
-
+  if (s.error) lines.push(`Status: ${s.error}`);
   if (s.has_budget && s.spend != null && s.max_budget != null) {
     lines.push(`Spend: $${s.spend.toFixed(2)} / $${s.max_budget.toFixed(2)}`);
-    lines.push(`Usage: ${s.percent?.toFixed(1)}%`);
+    if (!s.error) lines.push(`Usage: ${(s.percent ?? 0).toFixed(1)}%`);
   }
-  if (s.reset_time) {
-    const label = s.reset_label ? ` (${s.reset_label})` : "";
-    lines.push(`Reset${label}: ${s.reset_time}`);
+  if (!s.error && s.reset_time) {
+    lines.push(`Reset${s.reset_label ? ` (${s.reset_label})` : ""}: ${s.reset_time}`);
   }
   if (s.has_context && s.context_percent != null) {
     lines.push(`Context window: ${s.context_percent.toFixed(0)}%`);
   }
   if (s.update_available) {
-    lines.push(`Update available: ${s.update_available}`);
+    lines.push(`Update available: ${s.update_available} (re-run the installer, or brew/scoop upgrade)`);
   }
+  if (s.error) lines.push(`Diagnose: run \`${BINARY} doctor\` in a terminal`);
+  lines.push(`Binary: ${binary}${s.version ? ` (${s.version})` : ""}`);
   return lines.join("\n");
 }
 
 export function activate(ctx: vscode.ExtensionContext): void {
-  const item = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Right,
-    100
-  );
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   item.name = "Claude Code LiteLLM";
   item.command = "claudeCodeLitellm.refresh";
+  item.text = "LiteLLM: …";
+  item.show();
   ctx.subscriptions.push(item);
 
   let timer: NodeJS.Timeout | undefined;
+  let inFlight = false;
+
+  const showProblem = (text: string, tooltip: string) => {
+    item.text = `$(warning) ${text}`;
+    item.tooltip = tooltip;
+    item.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+  };
 
   const refresh = () => {
-    const cfg = vscode.workspace.getConfiguration("claudeCodeLitellm");
+    if (inFlight) return; // never stack processes when a refresh is slow
+    inFlight = true;
+
     const binary = resolveBinary();
-    const env = buildEnv();
+    let spawnError: NodeJS.ErrnoException | undefined;
+    let stdout = "";
 
     const proc = spawn(binary, ["--json"], {
-      env,
-      timeout: 5000,
-      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+      timeout: TIMEOUT_MS,
+      stdio: ["pipe", "pipe", "ignore"],
     });
-
-    // The binary reads Claude Code's stdin JSON; in VS Code there is no such
-    // payload, so send a minimal `{}` to avoid a blocking read.
-    proc.stdin.end("{}");
-
-    let stdout = "";
-    proc.stdout.on("data", (d) => (stdout += d.toString()));
-
-    proc.on("error", () => {
-      item.text = "$(error) LiteLLM: binary not found";
-      item.tooltip = "Install claude-code-litellm-plugin and set claudeCodeLitellm.binaryPath";
-      item.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
-      item.show();
+    proc.on("error", (err: NodeJS.ErrnoException) => {
+      spawnError = err;
     });
+    proc.stdin?.on("error", () => {
+      /* EPIPE when the binary is missing or exits early; reported via 'error'/'close'. */
+    });
+    // The binary reads Claude Code's stdin JSON; editors have none, so send `{}`.
+    proc.stdin?.end("{}");
+    proc.stdout?.on("data", (d) => (stdout += d.toString()));
 
-    proc.on("close", () => {
-      let parsed: StatusJSON = { error: "error" };
+    // Settle exactly once. Node emits 'close' after 'error' too (ENOENT), and a
+    // killed process may never 'close' if a grandchild still holds stdout.
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      inFlight = false;
+      fn();
+    };
+    proc.on("exit", (_code, signal) => {
+      if (signal) {
+        settle(() =>
+          showProblem("LiteLLM: timeout", `${binary} did not answer within ${TIMEOUT_MS / 1000}s. Run \`${BINARY} doctor\` in a terminal.`)
+        );
+      }
+    });
+    proc.on("close", () => settle(() => {
+      if (spawnError) {
+        showProblem(
+          "LiteLLM: binary not found",
+          spawnError.code === "ENOENT"
+            ? `${BINARY} was not found (${binary}). ${INSTALL_HINT}`
+            : `Could not run ${binary}: ${spawnError.message}`
+        );
+        return;
+      }
+      let parsed: StatusJSON;
       try {
         parsed = JSON.parse(stdout.trim());
       } catch {
-        parsed = { error: "error" };
+        showProblem("LiteLLM: error", `${binary} returned unexpected output. Run \`${BINARY} doctor\` in a terminal.`);
+        return;
+      }
+      if (!parsed.version) {
+        // Binaries before the --json settings-env loading don't report a version.
+        showProblem(
+          "LiteLLM: update binary",
+          `${binary} is older than this extension. Re-run the installer (or brew/scoop upgrade) to update it.`
+        );
+        return;
       }
       item.text = parsed.text || "LiteLLM: error";
-      item.tooltip = formatTooltip(parsed);
-      item.backgroundColor = backgroundColor(parsed.percent ?? 0, parsed.has_budget ?? false);
-      item.show();
-    });
+      item.tooltip = formatTooltip(parsed, binary);
+      item.backgroundColor = backgroundColor(parsed);
+    }));
   };
 
-  // Manual refresh command.
-  ctx.subscriptions.push(
-    vscode.commands.registerCommand("claudeCodeLitellm.refresh", refresh)
-  );
+  ctx.subscriptions.push(vscode.commands.registerCommand("claudeCodeLitellm.refresh", refresh));
 
-  // Initial refresh + interval.
-  refresh();
   const scheduleRefresh = () => {
-    const cfg = vscode.workspace.getConfiguration("claudeCodeLitellm");
-    const seconds = Math.max(5, cfg.get<number>("refreshSeconds") ?? 30);
+    const seconds = Math.max(5, vscode.workspace.getConfiguration("claudeCodeLitellm").get<number>("refreshSeconds") ?? 30);
     if (timer) clearInterval(timer);
     timer = setInterval(refresh, seconds * 1000);
   };
+  refresh();
   scheduleRefresh();
 
-  // Re-schedule when settings change.
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("claudeCodeLitellm")) {
@@ -200,7 +199,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
     })
   );
-
   ctx.subscriptions.push({ dispose: () => timer && clearInterval(timer) });
 }
 
