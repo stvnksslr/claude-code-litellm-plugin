@@ -76,12 +76,15 @@ func TestTeamInfoFailureHandling(t *testing.T) {
 	t.Run("5xx propagates as an error (not cached as no-budget)", func(t *testing.T) {
 		t.Setenv("XDG_CACHE_HOME", t.TempDir())
 		srv := keyTeamServer(t, http.StatusBadGateway)
-		_, err := budgetInfo(credential{token: "sk", baseURL: srv.URL})
-		var hErr *httpStatusError
-		if !errors.As(err, &hErr) || hErr.Status != http.StatusBadGateway {
-			t.Fatalf("budgetInfo() error = %v, want HTTP 502", err)
+		c := credential{token: "sk", baseURL: srv.URL}
+		_, err := budgetInfo(c)
+		// 5xx is connection-classified (a proxy-side outage, eligible for the
+		// stale fallback) rather than an authoritative httpStatusError — but it
+		// must still propagate, never be cached as "no budget".
+		if !isTransportErr(err) || !strings.Contains(err.Error(), "502") {
+			t.Fatalf("budgetInfo() error = %v, want transport-classified 502", err)
 		}
-		if _, ok := readBudgetCache(credential{token: "sk", baseURL: srv.URL}); ok {
+		if _, ok := readBudgetCache(c); ok {
 			t.Error("a failed /team/info must not be cached as success")
 		}
 	})

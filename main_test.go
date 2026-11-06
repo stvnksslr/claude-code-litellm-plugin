@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2264,7 +2266,8 @@ func TestErrorBodiesRedacted(t *testing.T) {
 	})
 
 	t.Run("other errors truncate body", func(t *testing.T) {
-		userInfoServer(t, 500, strings.Repeat("x", 5000))
+		// 4xx (not 5xx, which is transport-classified and body-free).
+		userInfoServer(t, 400, strings.Repeat("x", 5000))
 		_, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
 		if err == nil || len(err.Error()) > 500 || !strings.Contains(err.Error(), "truncated") {
 			t.Errorf("fetchUserInfo() error length = %d, want truncated body", len(fmt.Sprint(err)))
@@ -2359,11 +2362,21 @@ func TestFetchUserInfo(t *testing.T) {
 		}
 	})
 
-	t.Run("non-200 surfaces HTTP error", func(t *testing.T) {
+	t.Run("5xx classifies as transport, not authoritative", func(t *testing.T) {
+		// 5xx is a proxy-side outage: connection-classified so the stale
+		// fallback engages instead of rendering an error-shaped truth.
 		userInfoServer(t, 500, `{"error":{"message":"boom"}}`)
 		_, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
-		if err == nil || !strings.Contains(err.Error(), "HTTP error: status=500") {
-			t.Errorf("fetchUserInfo() error = %v, want HTTP error: status=500", err)
+		if !isTransportErr(err) {
+			t.Errorf("fetchUserInfo() error = %v, want 5xx classified as transport", err)
+		}
+	})
+
+	t.Run("non-200 surfaces HTTP error", func(t *testing.T) {
+		userInfoServer(t, 400, `{"error":{"message":"boom"}}`)
+		_, err := fetchUserInfo(context.Background(), gatewayCred("gw-jwt"))
+		if err == nil || !strings.Contains(err.Error(), "HTTP error: status=400") {
+			t.Errorf("fetchUserInfo() error = %v, want HTTP error: status=400", err)
 		}
 	})
 }
@@ -2500,5 +2513,710 @@ func TestSweepStaleTemps(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Errorf("non-temp cache file should survive: %v", err)
+	}
+}
+
+// --- Resilience port: stale fallback, backoff ladder, in-flight marker ---
+
+// writeStaleBudgetCache writes a budget cache entry with an arbitrary age so
+// stale-fallback tests can control freshness without sleeping.
+func writeStaleBudgetCache(t *testing.T, c credential, age time.Duration, spend, budget float64) {
+	t.Helper()
+	entry := BudgetCacheEntry{
+		Timestamp: time.Now().Add(-age).UnixMilli(),
+		Info:      KeyInfo{Spend: &spend, MaxBudget: &budget},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal cache entry: %v", err)
+	}
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatalf("mkdir cache dir: %v", err)
+	}
+	if err := os.WriteFile(budgetCacheFile(c), data, 0o600); err != nil {
+		t.Fatalf("write cache entry: %v", err)
+	}
+}
+
+// closedServer gives a server whose listener is already shut: any request
+// fails to dial, classifying as a transport error without sleeping.
+func closedServer(t *testing.T) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+}
+
+func TestBudgetInfoStaleFallbackOnTransport(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	closedServer(t)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo() error = %v, want stale-cache fallback", err)
+	}
+	if info.Spend == nil || *info.Spend != 42.0 {
+		t.Errorf("expected stale spend = 42.0, got %v", info.Spend)
+	}
+	if !info.stale {
+		t.Error("expected stale flag on fallback info")
+	}
+	// The fallback must not launder stale data into a fresh cache entry.
+	if _, ok := readBudgetCache(c); ok {
+		t.Error("fallback rewrote budget-<hash>.json with a fresh timestamp")
+	}
+	failed, ok := readBudgetFailCache(c)
+	if !ok {
+		t.Fatal("expected fail-cache entry after transport failure")
+	}
+	if failed.Kind != "transport" {
+		t.Errorf("expected fail kind transport, got %q", failed.Kind)
+	}
+}
+
+func TestBudgetInfoStaleFallbackOnFailReplay(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, time.Hour, 7.0, 10.0)
+	writeBudgetFailCache(c, fmt.Errorf("connection error: Get %q: context deadline exceeded [url=%s]", server.URL, server.URL))
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo() error = %v, want stale-cache fallback", err)
+	}
+	if info.Spend == nil || *info.Spend != 7.0 {
+		t.Errorf("expected stale spend = 7.0, got %v", info.Spend)
+	}
+	if !info.stale {
+		t.Error("expected stale flag on fallback info")
+	}
+	if hits != 0 {
+		t.Errorf("replay path must not touch the network, got %d calls", hits)
+	}
+}
+
+func TestBudgetInfoStaleFallbackExpires(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	closedServer(t)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, 7*time.Hour, 42.0, 100.0) // beyond StaleCacheMaxAgeMs
+
+	_, err := budgetInfo(c)
+	if err == nil {
+		t.Fatal("expected error once the stale entry is past StaleCacheMaxAgeMs")
+	}
+	if !isTransportErr(err) {
+		t.Errorf("expected transport error, got %v", err)
+	}
+}
+
+func TestBudgetInfoAuthErrorNotMaskedByStale(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("bad-token")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+
+	_, err := budgetInfo(c)
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("expected ErrAuth to surface despite stale cache, got %v", err)
+	}
+}
+
+// TestTeamInfo5xxFallsBackToStale: a 503 on /team/info is a proxy-side outage.
+// It must surface as transport (stale fallback) rather than "no budget".
+func TestTeamInfo5xxFallsBackToStale(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	teamID := "team-123"
+	keySpend := 16.54
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/key/info":
+			resp := KeyInfoResponse{Info: KeyInfo{Spend: &keySpend, TeamID: &teamID}}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/team/info":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo() error = %v, want stale fallback on /team/info 503", err)
+	}
+	if info.Spend == nil || *info.Spend != 42.0 {
+		t.Errorf("expected stale spend = 42.0, got %v", info.Spend)
+	}
+	if !info.stale {
+		t.Error("expected stale flag")
+	}
+	if _, ok := readBudgetCache(c); ok {
+		t.Error("team-less partial response was cached as fresh")
+	}
+}
+
+func TestGatewayTeam5xxFallsBackToStale(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/info":
+			_, _ = w.Write([]byte(`{"user_id":"user-1","user_info":{"teams":["team-1"],"spend":12.5,"max_budget":100},"teams":[{"team_id":"team-1","spend":80.25,"max_budget":500}]}`))
+		case "/team/info":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", server.URL)
+
+	c := gatewayCred("gw-jwt")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo(gateway) error = %v, want stale fallback", err)
+	}
+	if info.Spend == nil || *info.Spend != 42.0 {
+		t.Errorf("expected stale spend = 42.0, got %v", info.Spend)
+	}
+	if !info.stale {
+		t.Error("expected stale flag")
+	}
+}
+
+// --- Stale-flag rendering ---
+
+func TestStaleFlagSurvivesResolveEffectiveBudget(t *testing.T) {
+	spend := 25.0
+	budget := 100.0
+	info := &KeyInfo{
+		Spend:         &spend,
+		MaxBudget:     &budget,
+		TeamSpend:     &spend,
+		TeamMaxBudget: &budget,
+		stale:         true,
+	}
+	if !resolveEffectiveBudget(info).stale {
+		t.Error("resolveEffectiveBudget dropped the stale flag")
+	}
+}
+
+func testStatusInput() StatusInput {
+	return StatusInput{Model: struct {
+		DisplayName string `json:"display_name"`
+		ID          string `json:"id"`
+	}{DisplayName: "Test"}}
+}
+
+func TestFormatStatusLineShowsCachedMarker(t *testing.T) {
+	spend := 25.0
+	budget := 100.0
+	input := testStatusInput()
+	line := formatStatusLine(&KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget}, "", input)
+	if strings.Contains(stripANSI(line), "(cached)") {
+		t.Error("fresh data must not be labeled (cached)")
+	}
+	line = formatStatusLine(&KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget, stale: true}, "", input)
+	if !strings.Contains(stripANSI(line), "(cached)") {
+		t.Errorf("stale data must be labeled (cached), got %q", stripANSI(line))
+	}
+}
+
+func TestBuildStatusJSONStaleField(t *testing.T) {
+	spend := 25.0
+	budget := 100.0
+	input := testStatusInput()
+	if out := buildStatusJSON(&KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget}, "", input, nil); out.Stale {
+		t.Error("fresh data must not set stale")
+	}
+	if out := buildStatusJSON(&KeyInfo{TeamSpend: &spend, TeamMaxBudget: &budget, stale: true}, "", input, nil); !out.Stale {
+		t.Error("stale data must set stale=true in JSON output")
+	}
+}
+
+// --- Transport-error classification ---
+
+func TestIsTransportErrClassification(t *testing.T) {
+	_, timeoutErr := net.DialTimeout("tcp", "10.255.255.1:1", time.Millisecond)
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"wrapped client timeout", fmt.Errorf("connection error: %w [url=https://x]", timeoutErr), true},
+		{"Go client timeout text", fmt.Errorf(`connection error: Get "https://x": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`), true},
+		{"uppercase Timeout only", fmt.Errorf("Client.Timeout exceeded while awaiting headers"), true},
+		{"connection refused", fmt.Errorf("connection error: dial tcp: connection refused"), true},
+		{"unexpected EOF mid-body", fmt.Errorf("connection error: failed to read response: %w", io.ErrUnexpectedEOF), true},
+		{"context deadline exceeded value", fmt.Errorf("connection error: %w [url=https://x]", context.DeadlineExceeded), true},
+		{"auth error", fmt.Errorf("status=401 url=https://x: %w", ErrAuth), false},
+		{"budget exceeded", &BudgetExceededError{Spend: 1, MaxBudget: 2}, false},
+		{"JSON parse error", fmt.Errorf("JSON parse error: invalid character 'x'"), false},
+		{"HTTP 400", fmt.Errorf("HTTP error: status=400 url=https://x body=bad request"), false},
+		{"replayed transport sentinel", &cachedError{msg: `connection error: Get "https://x": deadline`, sentinel: ErrTransport}, true},
+	}
+	for _, tc := range cases {
+		if got := isTransportErr(tc.err); got != tc.want {
+			t.Errorf("%s: isTransportErr = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestWriteBudgetFailCacheKinds(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"transport", fmt.Errorf("connection error: dial tcp: i/o timeout"), "transport"},
+		{"auth", fmt.Errorf("status=403 url=x: %w", ErrAuth), "auth"},
+		{"budget", &BudgetExceededError{Spend: 5, MaxBudget: 10}, "budget"},
+		{"other (HTTP 400)", &httpStatusError{Status: 400, URL: "x", Body: "nope"}, "other"},
+	}
+	for _, tc := range cases {
+		writeBudgetFailCache(c, tc.err)
+		entry, ok := readBudgetFailCache(c)
+		if !ok {
+			t.Fatalf("%s: expected fail-cache entry", tc.name)
+		}
+		if entry.Kind != tc.want {
+			t.Errorf("%s: Kind = %q, want %q", tc.name, entry.Kind, tc.want)
+		}
+	}
+}
+
+func TestFailReplayRendersConnectionError(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	c := keyCred("test-token")
+	writeBudgetFailCache(c, fmt.Errorf("connection error: Get %q: context deadline exceeded [url=https://proxy]", "https://proxy"))
+	entry, ok := readBudgetFailCache(c)
+	if !ok {
+		t.Fatal("expected fail-cache entry")
+	}
+	line := renderLine(nil, "", testStatusInput(), errorFromFailEntry(entry))
+	if !strings.Contains(stripANSI(line), "Connection error") {
+		t.Errorf("replayed transport failure rendered %q, want Connection error", stripANSI(line))
+	}
+}
+
+// --- Backoff ladder ---
+
+func TestFailBackoffEscalatesWithJitter(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	// Backoff windows are [base<<n, base<<n+jitter]; ordered slice — map
+	// iteration order would scramble the attempt sequence.
+	ladder := []struct {
+		attempt int
+		lo, hi  int64
+	}{
+		{1, 10_000, 15_000},
+		{2, 20_000, 25_000},
+		{3, 40_000, 45_000},
+		{4, 60_000, 65_000},
+		{5, 60_000, 65_000}, // capped
+		{6, 60_000, 65_000}, // capped
+	}
+	for _, step := range ladder {
+		writeBudgetFailCache(c, fmt.Errorf("connection error: dial tcp: timeout"))
+		entry, ok := readBudgetFailCache(c)
+		if !ok {
+			t.Fatalf("attempt %d: expected active fail entry", step.attempt)
+		}
+		if entry.Attempts != step.attempt {
+			t.Fatalf("attempt %d: Attempts = %d", step.attempt, entry.Attempts)
+		}
+		remaining := entry.BackoffUntil - time.Now().UnixMilli()
+		if remaining < step.lo-1_000 || remaining > step.hi {
+			t.Errorf("attempt %d: backoff remaining = %dms, want in [%d,%d]", step.attempt, remaining, step.lo, step.hi)
+		}
+	}
+}
+
+func TestFailBackoffResetsAfterGap(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	writeBudgetFailCache(c, fmt.Errorf("connection error: dial tcp: timeout"))
+	writeBudgetFailCache(c, fmt.Errorf("connection error: dial tcp: timeout"))
+	entry, _ := readBudgetFailCacheEntry(c)
+	if entry.Attempts != 2 {
+		t.Fatalf("precondition: Attempts = %d, want 2", entry.Attempts)
+	}
+
+	// Simulate a long gap: backdate the previous failure beyond the reset window.
+	entry.Timestamp = time.Now().UnixMilli() - 3*BudgetFailCapMs
+	data, _ := json.Marshal(entry)
+	if err := os.WriteFile(budgetFailCacheFile(c), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeBudgetFailCache(c, fmt.Errorf("connection error: dial tcp: timeout"))
+	entry, _ = readBudgetFailCacheEntry(c)
+	if entry.Attempts != 1 {
+		t.Errorf("Attempts = %d after long gap, want reset to 1", entry.Attempts)
+	}
+}
+
+func TestFailLadderResetOnSuccess(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	hits := 0
+	spend, budget := 25.0, 100.0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		resp := KeyInfoResponse{Info: KeyInfo{Spend: &spend, MaxBudget: &budget}}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	writeBudgetFailCache(c, fmt.Errorf("connection error: dial tcp: timeout"))
+
+	// The fail entry is active: the first call replays it without network...
+	if _, err := budgetInfo(c); err == nil {
+		t.Fatal("expected replayed failure")
+	}
+	if hits != 0 {
+		t.Fatal("replay must not touch the network")
+	}
+	// ...so expire it, then a successful fetch must clear the ladder.
+	entry, _ := readBudgetFailCacheEntry(c)
+	entry.Timestamp = time.Now().Add(-2 * time.Duration(BudgetFailTTLMs) * time.Millisecond).UnixMilli()
+	entry.BackoffUntil = 0
+	data, _ := json.Marshal(entry)
+	if err := os.WriteFile(budgetFailCacheFile(c), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := budgetInfo(c); err != nil {
+		t.Fatalf("budgetInfo() error = %v", err)
+	}
+	if _, err := os.Stat(budgetFailCacheFile(c)); !os.IsNotExist(err) {
+		t.Error("successful fetch did not clear the fail cache; the next outage would inherit an escalated window")
+	}
+}
+
+// --- In-flight marker ---
+
+func TestInflightMarkerServesStaleWithoutNetwork(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+	if _, ok := claimMarker(c); !ok { // another process holds the fetch
+		t.Fatal("failed to claim marker for test setup")
+	}
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo() error = %v, want stale served while marker fresh", err)
+	}
+	if !info.stale || info.Spend == nil || *info.Spend != 42.0 {
+		t.Errorf("expected stale info served, got %+v", info)
+	}
+	if hits != 0 {
+		t.Errorf("in-flight marker must suppress the fetch, got %d hits", hits)
+	}
+	// The marker belongs to the (concurrent) fetching process: budgetInfo
+	// served stale without claiming it, so it must be left alone.
+	if !inflightActive(c) {
+		t.Error("unclaimed marker must not be cleared by a stale-serving reader")
+	}
+}
+
+func TestInflightMarkerExpiryReleasesFetch(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	spend, budget := 25.0, 100.0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := KeyInfoResponse{Info: KeyInfo{Spend: &spend, MaxBudget: &budget}}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+	// A marker left by a killed process, older than inflightFreshMs: must not
+	// stall real fetches forever.
+	staleMarker, _ := json.Marshal(inflightEntry{Timestamp: time.Now().UnixMilli() - inflightFreshMs - 1_000})
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(budgetInflightFile(c), staleMarker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo() error = %v, want expired marker to release the fetch", err)
+	}
+	if info.stale {
+		t.Error("expected a fresh fetch after marker expiry, got stale data")
+	}
+}
+
+func TestInflightMarkerNonceOwnership(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	owner, ok := claimMarker(c)
+	if !ok {
+		t.Fatal("claim failed")
+	}
+	// A reader must not delete a claim it doesn't own...
+	clearInflightMarker(c, "not-the-owner")
+	if !inflightActive(c) {
+		t.Fatal("foreign clear removed another process's marker")
+	}
+	// ...and the owner's clear does remove it.
+	clearInflightMarker(c, owner)
+	if inflightActive(c) {
+		t.Error("owner clear left its own marker in place")
+	}
+}
+
+// TestInflightColdStartFetchesAnyway pins the cold-start behavior: a fresh
+// marker with no cached data must not render an error or an empty line — the
+// session fetches and races the sibling instead.
+func TestInflightColdStartFetchesAnyway(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	hits := 0
+	spend, budget := 25.0, 100.0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		resp := KeyInfoResponse{Info: KeyInfo{Spend: &spend, MaxBudget: &budget}}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	if _, ok := claimMarker(c); !ok {
+		t.Fatal("claim failed")
+	}
+
+	info, err := budgetInfo(c)
+	if err != nil {
+		t.Fatalf("budgetInfo() error = %v, want cold start to fetch despite marker", err)
+	}
+	if info.Spend == nil || *info.Spend != 25.0 {
+		t.Errorf("expected fetched data, got %+v", info)
+	}
+	if hits < 1 {
+		t.Error("cold start did not fetch")
+	}
+}
+
+// --- Cache hardening ---
+
+func TestNegativeTimestampTreatedAsExpired(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	future := time.Now().Add(time.Hour).UnixMilli()
+	spend, budget := 42.0, 100.0
+	entry := BudgetCacheEntry{Timestamp: future, Info: KeyInfo{Spend: &spend, MaxBudget: &budget}}
+	data, _ := json.Marshal(entry)
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(budgetCacheFile(c), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readBudgetCache(c); ok {
+		t.Error("future timestamp must not read as fresh budget cache")
+	}
+	if _, ok := readBudgetCacheStale(c); ok {
+		t.Error("future timestamp must not read as valid stale entry")
+	}
+
+	fail := BudgetFailEntry{Timestamp: future, Kind: "transport", Message: "x"}
+	fdata, _ := json.Marshal(fail)
+	if err := os.WriteFile(budgetFailCacheFile(c), fdata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readBudgetFailCache(c); ok {
+		t.Error("future timestamp must not extend fail-cache backoff")
+	}
+}
+
+func TestCorruptBudgetCacheSelfHeals(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(budgetCacheFile(c), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readBudgetCacheEntry(c); ok {
+		t.Fatal("corrupt entry must not parse")
+	}
+	if _, err := os.Stat(budgetCacheFile(c)); !os.IsNotExist(err) {
+		t.Error("corrupt cache file was not removed; stale fallback would stay dead for the whole outage")
+	}
+}
+
+func TestFailCacheExpiryReleasesNetwork(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	hits := 0
+	spend, budget := 25.0, 100.0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		resp := KeyInfoResponse{Info: KeyInfo{Spend: &spend, MaxBudget: &budget}}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	t.Setenv("LITELLM_PROXY_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", server.URL)
+
+	c := keyCred("test-token")
+	// Legacy flat-TTL entry (no BackoffUntil), past its window.
+	stale := BudgetFailEntry{Timestamp: time.Now().Add(-2 * time.Duration(BudgetFailTTLMs) * time.Millisecond).UnixMilli(), Kind: "transport", Message: "old failure"}
+	fdata, _ := json.Marshal(stale)
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(budgetFailCacheFile(c), fdata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := budgetInfo(c); err != nil {
+		t.Fatalf("budgetInfo() error = %v, want expired fail entry to release a retry", err)
+	}
+	if hits == 0 {
+		t.Error("expired fail-cache entry did not release the network retry")
+	}
+}
+
+func TestStaleCacheBoundary(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	spend, budget := 42.0, 100.0
+	write := func(age time.Duration) {
+		entry := BudgetCacheEntry{Timestamp: time.Now().Add(-age).UnixMilli(), Info: KeyInfo{Spend: &spend, MaxBudget: &budget}}
+		data, _ := json.Marshal(entry)
+		if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(budgetCacheFile(c), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(time.Duration(StaleCacheMaxAgeMs)*time.Millisecond - time.Second)
+	if _, ok := readBudgetCacheStale(c); !ok {
+		t.Error("entry just inside StaleCacheMaxAgeMs must be served")
+	}
+
+	write(time.Duration(StaleCacheMaxAgeMs) * time.Millisecond)
+	if _, ok := readBudgetCacheStale(c); ok {
+		t.Error("entry at exactly StaleCacheMaxAgeMs must be rejected")
+	}
+}
+
+// --- Update-check version preservation ---
+
+func TestGetLatestVersionPreservesVersionOnFailure(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	origVersion, origFetch := Version, fetchLatestVersion
+	t.Cleanup(func() { Version, fetchLatestVersion = origVersion, origFetch })
+	Version = "1.0.0"
+	calls := 0
+	fetchLatestVersion = func() string { calls++; return "" }
+
+	// A previously-learned version, already past its TTL so the check re-runs.
+	entry := UpdateCacheEntry{Timestamp: time.Now().Add(-2 * time.Hour).UnixMilli(), LatestVersion: "v9.9.9"}
+	data, _ := json.Marshal(entry)
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(updateCacheFile(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := getLatestVersion(); got != "v9.9.9" {
+		t.Errorf("getLatestVersion() = %q, want preserved v9.9.9", got)
+	}
+	if v, ok := readUpdateCache(); !ok || v != "v9.9.9" {
+		t.Errorf("cache after failure = (%q, %v); want v9.9.9 with fresh backoff timestamp", v, ok)
+	}
+	// The failure still backs off: a second refresh must not re-hit GitHub.
+	before := calls
+	getLatestVersion()
+	if calls != before {
+		t.Errorf("backoff violated: GitHub hit %d more times", calls-before)
+	}
+}
+
+func TestGetLatestVersionFreshCachesSuccess(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	origVersion, origFetch := Version, fetchLatestVersion
+	t.Cleanup(func() { Version, fetchLatestVersion = origVersion, origFetch })
+	Version = "1.0.0"
+	calls := 0
+	fetchLatestVersion = func() string { calls++; return "v1.2.3" }
+
+	if got := getLatestVersion(); got != "v1.2.3" {
+		t.Errorf("getLatestVersion() = %q, want v1.2.3", got)
+	}
+	before := calls
+	if got := getLatestVersion(); got != "v1.2.3" {
+		t.Errorf("second getLatestVersion() = %q, want cached v1.2.3", got)
+	}
+	if calls != before {
+		t.Error("second call re-hit GitHub despite fresh cache")
 	}
 }
