@@ -2785,6 +2785,12 @@ func TestIsTransportErrClassification(t *testing.T) {
 		{"JSON parse error", fmt.Errorf("JSON parse error: invalid character 'x'"), false},
 		{"HTTP 400", fmt.Errorf("HTTP error: status=400 url=https://x body=bad request"), false},
 		{"replayed transport sentinel", &cachedError{msg: `connection error: Get "https://x": deadline`, sentinel: ErrTransport}, true},
+		// Keyword-in-text negatives: the substring fallback must not classify
+		// authoritative answers as transport just because a URL or proxy body
+		// happens to contain "connection"/"timeout"/"dial".
+		{"4xx body mentions connection", &httpStatusError{Status: 400, URL: "https://x", Body: "connection refused by upstream"}, false},
+		{"4xx body mentions timeout", &httpStatusError{Status: 404, URL: "https://x", Body: "request timeout in upstream pool"}, false},
+		{"auth URL mentions dial", fmt.Errorf("status=401 url=https://dial.example: %w", ErrAuth), false},
 	}
 	for _, tc := range cases {
 		if got := isTransportErr(tc.err); got != tc.want {
@@ -2795,7 +2801,6 @@ func TestIsTransportErrClassification(t *testing.T) {
 
 func TestWriteBudgetFailCacheKinds(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	c := keyCred("test-token")
 
 	cases := []struct {
 		name string
@@ -2807,15 +2812,65 @@ func TestWriteBudgetFailCacheKinds(t *testing.T) {
 		{"budget", &BudgetExceededError{Spend: 5, MaxBudget: 10}, "budget"},
 		{"other (HTTP 400)", &httpStatusError{Status: 400, URL: "x", Body: "nope"}, "other"},
 	}
-	for _, tc := range cases {
-		writeBudgetFailCache(c, tc.err)
-		entry, ok := readBudgetFailCache(c)
+	// A distinct credential per case: the record-preservation rule makes a
+	// later transport/other write inherit an existing auth/budget kind.
+	for i, tc := range cases {
+		cc := keyCred(fmt.Sprintf("kind-token-%d", i))
+		writeBudgetFailCache(cc, tc.err)
+		entry, ok := readBudgetFailCache(cc)
 		if !ok {
 			t.Fatalf("%s: expected fail-cache entry", tc.name)
 		}
 		if entry.Kind != tc.want {
 			t.Errorf("%s: Kind = %q, want %q", tc.name, entry.Kind, tc.want)
 		}
+	}
+}
+
+func TestFailRecordPreservedOverTransportBlip(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	// An authoritative auth record...
+	writeBudgetFailCache(c, fmt.Errorf("status=401 url=x: %w", ErrAuth))
+	// ...aged past its backoff so a fetch is attempted again...
+	entry, _ := readBudgetFailCacheEntry(c)
+	entry.Timestamp = time.Now().UnixMilli() - 2*BudgetFailCapMs
+	entry.BackoffUntil = 0
+	data, _ := json.Marshal(entry)
+	if err := os.WriteFile(budgetFailCacheFile(c), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// ...then a transport blip must not overwrite the authoritative kind.
+	writeBudgetFailCache(c, fmt.Errorf("connection error: dial tcp: timeout"))
+	entry, _ = readBudgetFailCacheEntry(c)
+	if entry.Kind != "auth" {
+		t.Errorf("Kind = %q after transport blip, want preserved %q", entry.Kind, "auth")
+	}
+	if entry.BackoffUntil <= time.Now().UnixMilli() {
+		t.Error("preserved record must still restart the backoff from this failure")
+	}
+}
+
+func TestStaleNotServedWhileAuthRecordExists(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	closedServer(t)
+
+	c := keyCred("test-token")
+	writeStaleBudgetCache(t, c, 5*time.Minute, 42.0, 100.0)
+	// An expired auth record: the key was revoked; stale data must not mask it.
+	entry := BudgetFailEntry{Timestamp: time.Now().UnixMilli() - 2*BudgetFailCapMs, Kind: "auth", Message: "status=401"}
+	data, _ := json.Marshal(entry)
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(budgetFailCacheFile(c), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := budgetInfo(c)
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("budgetInfo() error = %v, want auth error to surface despite stale cache", err)
 	}
 }
 
@@ -3218,5 +3273,83 @@ func TestGetLatestVersionFreshCachesSuccess(t *testing.T) {
 	}
 	if calls != before {
 		t.Error("second call re-hit GitHub despite fresh cache")
+	}
+}
+
+// --- Review-follow-up regression tests ---
+
+func TestStaleNoBudgetLabeledInBothModes(t *testing.T) {
+	input := testStatusInput()
+	// resolveEffectiveBudget must carry the flag into the no-budget branch...
+	info := resolveEffectiveBudget(&KeyInfo{stale: true})
+	if !info.stale {
+		t.Fatal("resolveEffectiveBudget dropped stale in the no-budget branch")
+	}
+	line := formatStatusLine(&KeyInfo{stale: true}, "", input)
+	if !strings.Contains(stripANSI(line), "No budget configured (cached)") {
+		t.Errorf("text mode: got %q, want No budget configured (cached)", stripANSI(line))
+	}
+	// ...and buildStatusJSON must set stale on its own no-budget early return.
+	if out := buildStatusJSON(&KeyInfo{stale: true}, "", input, nil); !out.Stale {
+		t.Error("json mode: no-budget early return dropped the stale flag")
+	}
+}
+
+func TestMarkerTakeoverDoesNotStealFreshClaim(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := keyCred("test-token")
+
+	// An orphaned stale marker M1. P2 takes it over (rename + fresh claim M2).
+	staleMarker, _ := json.Marshal(inflightEntry{Timestamp: time.Now().UnixMilli() - 2*inflightFreshMs})
+	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(budgetInflightFile(c), staleMarker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owner2, ok := claimInflight(c)
+	if !ok {
+		t.Fatal("takeover of the orphaned marker failed")
+	}
+	if !inflightActive(c) {
+		t.Fatal("fresh claim M2 missing after takeover")
+	}
+
+	// P3 arrives while M2 is fresh: its claim must fail and M2 must survive —
+	// neither a remove-based takeover nor a foreign clear may steal it.
+	if _, ok := claimInflight(c); ok {
+		t.Error("claim succeeded against a fresh marker held by another process")
+	}
+	clearInflightMarker(c, "not-the-owner")
+	if !inflightActive(c) {
+		t.Error("foreign clear removed P2's live claim")
+	}
+	clearInflightMarker(c, owner2)
+	if inflightActive(c) {
+		t.Error("owner clear left its own marker")
+	}
+}
+
+func TestUpdateSiblingSuccessSurvivesFailure(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	origVersion, origFetch := Version, fetchLatestVersion
+	t.Cleanup(func() { Version, fetchLatestVersion = origVersion, origFetch })
+	Version = "1.0.0"
+
+	// Simulate a concurrent sibling succeeding between our cache read and our
+	// failed fetch: the stub writes a fresh success entry, then fails.
+	fetchLatestVersion = func() string {
+		entry := UpdateCacheEntry{Timestamp: time.Now().UnixMilli(), LatestVersion: "v2.0.0"}
+		data, _ := json.Marshal(entry)
+		_ = os.MkdirAll(cacheDir(), 0o755)
+		_ = os.WriteFile(updateCacheFile(), data, 0o600)
+		return ""
+	}
+
+	if got := getLatestVersion(); got != "v2.0.0" {
+		t.Errorf("getLatestVersion() = %q, want the sibling's v2.0.0", got)
+	}
+	if v, ok := readUpdateCache(); !ok || v != "v2.0.0" {
+		t.Errorf("cache = (%q, %v), want sibling's v2.0.0 preserved", v, ok)
 	}
 }

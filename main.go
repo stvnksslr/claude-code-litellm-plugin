@@ -191,10 +191,12 @@ type KeyInfo struct {
 	TeamBudgetResetAt  *string  `json:"team_budget_reset_at"`
 	TeamBudgetDuration *string  `json:"team_budget_duration"`
 
-	// stale marks that this info came from the stale-cache fallback after a
-	// transport failure, so renderers can label it. Unexported: it is a
-	// render-time flag, never marshaled into the cache file or parsed from API
-	// responses — only a real fetch sets fresh data.
+	// stale marks that this info was not freshly fetched in this call —
+	// either the stale-cache fallback after a transport failure, or a
+	// deferral while another process holds the in-flight fetch. Renderers
+	// label it "(cached)". Unexported: it is a render-time flag, never
+	// marshaled into the cache file or parsed from API responses — only a
+	// real fetch sets fresh data.
 	stale bool
 }
 
@@ -245,7 +247,9 @@ func resolveEffectiveBudget(info *KeyInfo) *KeyInfo {
 			stale:          info.stale,
 		}
 	}
-	return &KeyInfo{}
+	// Preserve the flag in the no-budget branch too: stale data that said
+	// "no budget" must still render its "(cached)" label.
+	return &KeyInfo{stale: info.stale}
 }
 
 // GitHubRelease represents the GitHub releases API response
@@ -361,9 +365,29 @@ func claimInflight(c credential) (string, bool) {
 	if nonce, ok := claimMarker(c); ok {
 		return nonce, true
 	}
-	if !inflightActive(c) {
-		_ = os.Remove(budgetInflightFile(c))
-		return claimMarker(c)
+	// Orphan takeover: the marker is stale or unreadable. Detach it with a
+	// rename rather than a remove — exactly one concurrent taker's rename
+	// succeeds (a loser gets ENOENT and just fails to claim).
+	if inflightActive(c) {
+		return "", false
+	}
+	takeover := budgetInflightFile(c) + ".tmp-takeover-" + strconv.FormatInt(rand.Int64N(1<<62), 36)
+	if err := os.Rename(budgetInflightFile(c), takeover); err == nil {
+		// A sibling may have claimed a fresh marker between our check and the
+		// rename; the detached file tells us. If it was fresh, restore it —
+		// via link(2), so a claim that landed in between is never clobbered.
+		if data, rerr := os.ReadFile(takeover); rerr == nil {
+			var e inflightEntry
+			if json.Unmarshal(data, &e) == nil && cacheFresh(e.Timestamp, inflightFreshMs) {
+				_ = os.Link(takeover, budgetInflightFile(c))
+				_ = os.Remove(takeover)
+				return "", false
+			}
+		}
+		if nonce, ok := claimMarker(c); ok {
+			return nonce, true
+		}
+		// Someone re-claimed between our rename and claim — defer to them.
 	}
 	return "", false
 }
@@ -377,16 +401,19 @@ func claimMarker(c credential) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	f, err := os.OpenFile(budgetInflightFile(c), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
+	// Publish atomically via link(2): the marker never exists as an empty or
+	// half-written file, so a reader either sees a complete claim or none.
+	// EEXIST means the claim was taken — there is nothing to clean up.
+	tmp := budgetInflightFile(c) + ".tmp-" + nonce
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		_ = os.Remove(tmp)
 		return "", false
 	}
-	_, werr := f.Write(data)
-	cerr := f.Close()
-	if werr != nil || cerr != nil {
-		_ = os.Remove(budgetInflightFile(c))
+	if err := os.Link(tmp, budgetInflightFile(c)); err != nil {
+		_ = os.Remove(tmp)
 		return "", false
 	}
+	_ = os.Remove(tmp)
 	return nonce, true
 }
 
@@ -403,6 +430,13 @@ func clearInflightMarker(c credential, nonce string) {
 	if json.Unmarshal(data, &entry) != nil || entry.Owner != nonce {
 		return // someone else's (or unreadable) claim — leave it alone
 	}
+	// A stale-or-older marker is takeover-eligible; removing it here could
+	// delete a successor's fresh claim that replaced ours since the read.
+	// Only remove a marker that is still fresh — ours can only be, since a
+	// live fetch is bounded well below inflightFreshMs.
+	if !cacheFresh(entry.Timestamp, inflightFreshMs) {
+		return
+	}
 	_ = os.Remove(budgetInflightFile(c))
 }
 
@@ -410,6 +444,15 @@ func clearInflightMarker(c credential, nonce string) {
 // ladder after a successful fetch.
 func clearBudgetFailCache(c credential) {
 	_ = os.Remove(budgetFailCacheFile(c))
+}
+
+// authoritativeFailRecord reports whether the fail cache holds an unresolved
+// auth/budget record — even one past its backoff. Stale data must not mask
+// those states; only a successful fetch (or a fresher authoritative error)
+// resolves them.
+func authoritativeFailRecord(c credential) bool {
+	entry, ok := readBudgetFailCacheEntry(c)
+	return ok && (entry.Kind == "auth" || entry.Kind == "budget")
 }
 
 // updateCacheFile is intentionally NOT namespaced by key: the latest GitHub release
@@ -554,6 +597,15 @@ func isTransportErr(err error) bool {
 		// Any net/http round-trip failure: dial, reset, refused, mid-body EOF.
 		return true
 	}
+	// Authoritative answers are never transport, even when their error text
+	// echoes a URL or proxy body that happens to contain the substrings below.
+	var hErr *httpStatusError
+	if errors.As(err, &hErr) {
+		return false
+	}
+	if errors.Is(err, ErrAuth) {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "timeout") ||
 		strings.Contains(msg, "connection") ||
@@ -605,7 +657,10 @@ func readBudgetFailCache(c credential) (*BudgetFailEntry, bool) {
 		return nil, false
 	}
 	if entry.BackoffUntil > 0 {
-		if time.Now().UnixMilli() < entry.BackoffUntil {
+		// The backoff never legitimately exceeds cap+jitter; a larger remaining
+		// window means the clock stepped backwards after the write — expired.
+		remaining := entry.BackoffUntil - time.Now().UnixMilli()
+		if remaining > 0 && remaining <= BudgetFailCapMs+BudgetFailJitterMs {
 			return entry, true
 		}
 		return nil, false
@@ -627,9 +682,10 @@ func writeBudgetFailCache(c credential, fetchErr error) {
 		Timestamp: now,
 		Message:   fetchErr.Error(),
 	}
+	prev, prevOK := readBudgetFailCacheEntry(c)
 	// Escalate on consecutive failures; a long gap since the previous one
 	// means the proxy likely recovered in between, so restart the ladder.
-	if prev, ok := readBudgetFailCacheEntry(c); ok && now-prev.Timestamp <= 2*BudgetFailCapMs {
+	if prevOK && now-prev.Timestamp <= 2*BudgetFailCapMs {
 		entry.Attempts = prev.Attempts + 1
 	} else {
 		entry.Attempts = 1
@@ -657,6 +713,17 @@ func writeBudgetFailCache(c credential, fetchErr error) {
 		// HTTP-status and parse failures are authoritative answers, not
 		// outages — the replay path must not degrade them to stale cache.
 		entry.Kind = "other"
+	}
+	// An authoritative record (revoked key, exceeded budget) outlives a
+	// transport blip: preserve its kind and payload so the replay path keeps
+	// surfacing the real state instead of degrading to stale cache, while
+	// still restarting the backoff clock from this failure.
+	if prevOK && (prev.Kind == "auth" || prev.Kind == "budget") &&
+		(entry.Kind == "transport" || entry.Kind == "other") {
+		entry.Kind = prev.Kind
+		entry.Message = prev.Message
+		entry.Spend = prev.Spend
+		entry.MaxBudget = prev.MaxBudget
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -775,7 +842,12 @@ func getLatestVersion() string {
 	if latest == "" {
 		// Fetch failed (network/rate limit): the pre-written empty entry keeps
 		// the backoff, but re-persist the last known version so a transient
-		// failure doesn't erase the update notice for the full hour.
+		// failure doesn't erase the update notice for the full hour. Re-read
+		// the disk entry first: a concurrent sibling may have fetched a real
+		// version while we were failing — never overwrite its success.
+		if cur, ok := readUpdateCacheEntry(); ok && cur.LatestVersion != "" && cacheFresh(cur.Timestamp, UpdateCheckTTLMs) {
+			return cur.LatestVersion
+		}
 		if prior != nil && prior.LatestVersion != "" {
 			writeUpdateCache(prior.LatestVersion)
 			return prior.LatestVersion
@@ -1237,18 +1309,30 @@ func budgetInfo(c credential) (*KeyInfo, error) {
 	// a concurrently-fetching sibling just races, as before, which beats
 	// rendering nothing.
 	if inflightActive(c) {
-		if stale, ok := readBudgetCacheStale(c); ok {
+		if stale, ok := readBudgetCacheStale(c); ok && !authoritativeFailRecord(c) {
 			stale.stale = true
 			return stale, nil
 		}
 		// fall through: nothing cached to show, so fetch and race the sibling
 	} else if nonce, claimed := claimInflight(c); claimed {
 		defer clearInflightMarker(c, nonce)
+	} else if inflightActive(c) {
+		// Lost the exclusive claim to a sibling whose marker landed after our
+		// first check — same deferral as above.
+		if stale, ok := readBudgetCacheStale(c); ok && !authoritativeFailRecord(c) {
+			stale.stale = true
+			return stale, nil
+		}
 	}
 	info, err := fetchBudget(c)
 	if err != nil {
 		writeBudgetFailCache(c, err)
 		if isTransportErr(err) {
+			// A preserved authoritative record (revoked key, exceeded budget)
+			// outranks the blip: surface the real state instead of stale data.
+			if failed, ok := readBudgetFailCache(c); ok && (failed.Kind == "auth" || failed.Kind == "budget") {
+				return nil, errorFromFailEntry(failed)
+			}
 			if stale, ok := readBudgetCacheStale(c); ok {
 				stale.stale = true
 				return stale, nil
@@ -1387,13 +1471,21 @@ func getJSON(ctx context.Context, c credential, path string, out any) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("connection error: failed to read response: %w", err)
-	}
-
+	// Decide auth from the status alone, before touching the body: auth
+	// errors omit the body entirely (it can echo token-derived details), and
+	// a broken transfer on a 401 must not reclassify as transport.
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("status=%d url=%s: %w", resp.StatusCode, endpoint, ErrAuth)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// A broken transfer is transport when the payload is the answer
+		// (2xx, 5xx); for other statuses the headers already decide.
+		if resp.StatusCode >= 500 || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
+			return fmt.Errorf("connection error: failed to read response: %w", err)
+		}
+		return &httpStatusError{Status: resp.StatusCode, URL: endpoint, Body: "(unreadable)"}
 	}
 	if resp.StatusCode != http.StatusOK {
 		var litellmErr liteLLMError
@@ -1824,8 +1916,10 @@ type StatusJSON struct {
 	Version        string  `json:"version"`
 	ContextPercent float64 `json:"context_percent,omitempty"`
 	HasContext     bool    `json:"has_context"`
-	// Stale is true when the budget came from the stale-cache fallback after a
-	// transport failure — data may be up to StaleCacheMaxAgeMs old.
+	// Stale is true when the budget was not freshly fetched in this call —
+	// the stale-cache fallback after a transport failure, or a deferral while
+	// another process holds the in-flight fetch. Data may be up to
+	// StaleCacheMaxAgeMs old.
 	Stale bool   `json:"stale,omitempty"`
 	Error string `json:"error,omitempty"`
 }
@@ -1920,6 +2014,7 @@ func buildStatusJSON(info *KeyInfo, latestVersion string, input StatusInput, err
 	info = resolveEffectiveBudget(info)
 	if info.MaxBudget == nil || *info.MaxBudget <= 0 {
 		out.Error = "no budget configured"
+		out.Stale = info.stale
 		return out
 	}
 

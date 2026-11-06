@@ -271,6 +271,7 @@ func doctorFetch(d *doctor, cred credential) {
 		return
 	}
 	writeBudgetCache(cred, info) // a successful check also warms the cache
+	clearBudgetFailCache(cred)   // and resets the failure ladder, like budgetInfo
 	eff := resolveEffectiveBudget(info)
 	if eff.MaxBudget == nil || *eff.MaxBudget <= 0 {
 		d.warn("budget: connected, but no team/user max_budget is configured in LiteLLM (the status line shows \"No budget configured\")")
